@@ -3,12 +3,6 @@
 ## 接口原型
 
 ```python
-# 带自动求导的 Python 封装
-turbo_physai.grid_sample(
-    input, grid, mode="bilinear", padding_mode="zeros", align_corners=None
-) -> Tensor
-
-# 原生前向 / 反向
 turbo_physai.ops.grid_sample_forward(
     input, grid, interpolation_mode, padding_mode, align_corners
 ) -> Tensor
@@ -17,7 +11,7 @@ turbo_physai.ops.grid_sample_backward(
 ) -> Tuple[Tensor, Tensor]
 ```
 
-接口位置：`turbo_physai`（顶层导出）、`turbo_physai.ops`（原生）。实现见 `turbo_physai/operators/grid_sample.py`。
+接口位置：`turbo_physai.ops`。该接口直接调用编译后的原生扩展；`turbo_physai.grid_sample` 是另行提供的 Python 自动求导封装。
 
 ## 功能描述
 
@@ -53,7 +47,7 @@ Python 封装：
 
 ```python
 import torch
-from turbo_physai import grid_sample
+from turbo_physai import ops
 input = torch.randn(
     2,
     32,
@@ -75,21 +69,15 @@ grid = (
     * 2
     - 1
 ).requires_grad_()
-out = grid_sample(
-    input,
-    grid,
-    mode="bilinear",
-    padding_mode="zeros",
-    align_corners=False,
+out = ops.grid_sample_forward(input, grid, 0, 0, False)
+grad_input, grad_grid = ops.grid_sample_backward(
+    torch.ones_like(out), input, grid, 0, 0, False, [True, True]
 )
-out.sum().backward()
 torch.cuda.synchronize()
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
-    f"input.grad shape: {input.grad.shape}, "
-    f"input.grad dtype: {input.grad.dtype}, "
-    f"grid.grad shape: {grid.grad.shape}, "
-    f"grid.grad dtype: {grid.grad.dtype}"
+    f"input grad shape: {grad_input.shape}, input grad dtype: {grad_input.dtype}, "
+    f"grid grad shape: {grad_grid.shape}, grid grad dtype: {grad_grid.dtype}"
 )
 ```
 

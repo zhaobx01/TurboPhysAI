@@ -18,11 +18,7 @@ from turbo_physai import ops
 out = ops.bev_pool_forward(x, geom_feats, interval_lengths, interval_starts, B, D, H, W)
 ```
 
-部分算子在 `turbo_physai/operators/` 下有带 autograd 支持的 Python 封装，可从包顶层导入：
-
-```python
-from turbo_physai import grid_sample, interpolate, deformable_aggregation_function
-```
+本目录的接口示例统一直接调用 `turbo_physai.ops` 原生接口。
 
 ## API 清单
 
@@ -30,9 +26,9 @@ from turbo_physai import grid_sample, interpolate, deformable_aggregation_functi
 |---|---|---|---|
 | 特征融合 | [bev_pool_forward / bev_pool_backward](./context/bev_pool.md) | `turbo_physai.ops` | BEV 池化前向与反向 |
 | 特征融合 | [bev_pool_prepare / bev_pool_prepare_geometry](./context/bev_pool.md) | `turbo_physai.ops` | BEV 池化坐标与排序准备 |
-| 采样 | [deformable_aggregation_function](./context/deformable_aggregation.md) | `turbo_physai` | 可变形聚合 |
-| 采样 | [grid_sample](./context/grid_sample.md) | `turbo_physai` | 2D 双线性网格采样 |
-| 采样 | [interpolate](./context/upsample_bilinear_2d.md) | `turbo_physai` | 2D 双线性上采样 |
+| 采样 | [deformable_aggregation_forward / backward](./context/deformable_aggregation.md) | `turbo_physai.ops` | 可变形聚合 |
+| 采样 | [grid_sample_forward / backward](./context/grid_sample.md) | `turbo_physai.ops` | 2D 双线性网格采样 |
+| 采样 | [upsample_bilinear_2d_forward / backward](./context/upsample_bilinear_2d.md) | `turbo_physai.ops` | 2D 双线性上采样 |
 | 体素化 | [hard_voxelize](./context/hard_voxelize.md) | `turbo_physai.ops` | 固定体素数的硬体素化 |
 | 体素化 | [dynamic_voxelize](./context/dynamic_voxelize.md) | `turbo_physai.ops` | 动态体素化 |
 | 体素化 | [dynamic_point_to_voxel_forward / backward](./context/dynamic_point_to_voxel.md) | `turbo_physai.ops` | 点到体素归约与其反向 |

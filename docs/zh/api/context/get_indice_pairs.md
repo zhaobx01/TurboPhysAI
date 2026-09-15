@@ -3,12 +3,6 @@
 ## 接口原型
 
 ```python
-# Python 封装：自动推导输出形状并广播标量参数
-turbo_physai.optimizations.common.mmdet3d.sparse_conv.get_indice_pairs(
-    indices, batch_size, spatial_shape, ksize=3, stride=1, padding=0,
-    dilation=1, out_padding=0, subm=False, transpose=False, grid=None
-) -> Tuple[Tensor, Tensor, Tensor]
-
 # 原生接口（按维度选择 2d / 3d / 4d；grid 变体仅 2d / 3d）
 turbo_physai.ops.get_indice_pairs_3d(
     indices, batch_size, out_spatial_shape, spatial_shape,
@@ -21,7 +15,7 @@ turbo_physai.ops.get_indice_pairs_grid_3d(
 ) -> Tuple[Tensor, Tensor, Tensor]
 ```
 
-接口位置：`turbo_physai.ops`。Python 封装见 `turbo_physai/optimizations/common/mmdet3d/sparse_conv.py`。
+接口位置：`turbo_physai.ops`。下面的调用直接使用原生扩展；Python 辅助封装见 `turbo_physai/optimizations/common/mmdet3d/sparse_conv.py`。
 
 ## 功能描述
 
@@ -29,19 +23,11 @@ turbo_physai.ops.get_indice_pairs_grid_3d(
 
 ## 参数说明
 
-Python 封装：
-
 - `indices(Tensor)`：int32，shape `[num_points, NDim + 1]`，第一列为 batch 索引。
 - `batch_size(int)`：batch 大小。
+- `out_spatial_shape(list[int])`：输出空间形状，由调用方提前计算。
 - `spatial_shape(list[int])`：输入空间形状，长度 `NDim`。
-- `ksize / stride / padding / dilation / out_padding`：卷积核、步长、填充、膨胀、输出填充，标量或长度 `NDim` 的列表。
-- `subm(bool)`：子流形卷积；为 `True` 时输出形状等于 `spatial_shape`。
-- `transpose(bool)`：转置卷积；为 `True` 时按反卷积公式计算输出形状。
-- `grid(Tensor | None)`：预计算的输出网格；为 `None` 时调用普通版本，否则走 `get_indice_pairs_grid_*`。
-
-原生接口：
-
-- `out_spatial_shape(list[int])`：输出空间形状；非 subm 时按公式提前算出。
+- `kernel_size / stride / padding / dilation / out_padding`：长度均为 `NDim` 的列表。
 - `subm / transpose(int)`：`0` / `1`。
 - `grid(Tensor)`：int32，长度 `batch_size * prod(out_spatial_shape)`，元素为输出激活下标或 `-1`。
 
@@ -64,9 +50,7 @@ Python 封装：
 
 ```python
 import torch
-from turbo_physai.optimizations.common.mmdet3d.sparse_conv import (
-    get_indice_pairs,
-)
+from turbo_physai import ops
 indices = torch.tensor(
     [
         [0, 1, 2, 3],
@@ -77,12 +61,18 @@ indices = torch.tensor(
     dtype=torch.int32,
     device="cuda",
 )
-out_inds, indice_pairs, indice_num = get_indice_pairs(
+out_inds, indice_pairs, indice_num = ops.get_indice_pairs_3d(
     indices,
-    batch_size=1,
-    spatial_shape=[5, 5, 5],
-    ksize=3,
-    subm=True,
+    1,
+    [5, 5, 5],
+    [5, 5, 5],
+    [3, 3, 3],
+    [1, 1, 1],
+    [1, 1, 1],
+    [1, 1, 1],
+    [0, 0, 0],
+    1,
+    0,
 )
 torch.cuda.synchronize()
 print(

@@ -3,13 +3,6 @@
 ## 接口原型
 
 ```python
-# 带自动求导的 Python 封装
-turbo_physai.interpolate(
-    input, size=None, scale_factor=None, mode="bilinear",
-    align_corners=None, recompute_scale_factor=None, antialias=False
-) -> Tensor
-
-# 原生前向 / 反向
 turbo_physai.ops.upsample_bilinear_2d_forward(
     input, output_size, align_corners, scale_factors
 ) -> Tensor
@@ -18,7 +11,7 @@ turbo_physai.ops.upsample_bilinear_2d_backward(
 ) -> Tensor
 ```
 
-接口位置：`turbo_physai`（顶层导出）、`turbo_physai.ops`（原生）。实现见 `turbo_physai/operators/upsample_bilinear_2d.py`。
+接口位置：`turbo_physai.ops`。该接口直接调用编译后的原生扩展；`turbo_physai.interpolate` 是另行提供的 Python 自动求导封装。
 
 ## 功能描述
 
@@ -57,7 +50,7 @@ Python 封装：
 
 ```python
 import torch
-from turbo_physai import interpolate
+from turbo_physai import ops
 input = torch.randn(
     2,
     64,
@@ -67,18 +60,14 @@ input = torch.randn(
     dtype=torch.float32,
     requires_grad=True,
 )
-out = interpolate(
-    input,
-    size=(64, 64),
-    mode="bilinear",
-    align_corners=False,
+out = ops.upsample_bilinear_2d_forward(input, [64, 64], False, None)
+grad_input = ops.upsample_bilinear_2d_backward(
+    torch.ones_like(out), [64, 64], list(input.shape), False, None
 )
-out.sum().backward()
 torch.cuda.synchronize()
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
-    f"input.grad shape: {input.grad.shape}, "
-    f"input.grad dtype: {input.grad.dtype}"
+    f"input grad shape: {grad_input.shape}, input grad dtype: {grad_input.dtype}"
 )
 ```
 

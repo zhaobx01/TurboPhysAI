@@ -54,9 +54,7 @@ turbo_physai.ops.fused_indice_conv_fp32(
 ```python
 import torch
 from turbo_physai import ops
-from turbo_physai.optimizations.common.mmdet3d.sparse_conv import (
-    get_indice_pairs,
-)
+from turbo_physai import ops
 indices = torch.tensor(
     [
         [0, 1, 2, 3],
@@ -67,12 +65,9 @@ indices = torch.tensor(
     dtype=torch.int32,
     device="cuda",
 )
-out_inds, indice_pairs, indice_num = get_indice_pairs(
-    indices,
-    batch_size=1,
-    spatial_shape=[5, 5, 5],
-    ksize=3,
-    subm=True,
+out_inds, indice_pairs, indice_num = ops.get_indice_pairs_3d(
+    indices, 1, [5, 5, 5], [5, 5, 5], [3, 3, 3], [1, 1, 1],
+    [1, 1, 1], [1, 1, 1], [0, 0, 0], 1, 0,
 )
 features = torch.randn(
     4,

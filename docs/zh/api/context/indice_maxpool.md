@@ -50,9 +50,7 @@ turbo_physai.ops.indice_maxpool_backward_fp32(
 ```python
 import torch
 from turbo_physai import ops
-from turbo_physai.optimizations.common.mmdet3d.sparse_conv import (
-    get_indice_pairs,
-)
+from turbo_physai import ops
 indices = torch.tensor(
     [
         [0, 1, 2, 3],
@@ -69,12 +67,9 @@ features = torch.rand(
     device="cuda",
     dtype=torch.float32,
 )
-out_inds, indice_pairs, indice_num = get_indice_pairs(
-    indices,
-    batch_size=1,
-    spatial_shape=[5, 5, 5],
-    ksize=3,
-    subm=True,
+out_inds, indice_pairs, indice_num = ops.get_indice_pairs_3d(
+    indices, 1, [5, 5, 5], [5, 5, 5], [3, 3, 3], [1, 1, 1],
+    [1, 1, 1], [1, 1, 1], [0, 0, 0], 1, 0,
 )
 out = ops.indice_maxpool_fp32(
     features,
