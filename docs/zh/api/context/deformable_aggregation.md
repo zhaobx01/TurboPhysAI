@@ -56,25 +56,19 @@ Python 封装 `turbo_physai.deformable_aggregation_function`：
 ```python
 import torch
 from turbo_physai import deformable_aggregation_function
-
 B, C, numGroups = 1, 32, 8
 anchor, pts, cam, scale, H, W = 10, 10, 1, 1, 32, 88
 num_feat = cam * scale * H * W
-
 feature_maps = torch.rand(B, num_feat, C, device="cuda", requires_grad=True)
 spatial_shape = torch.tensor([[[H, W]] * scale] * cam, dtype=torch.int32, device="cuda")
 scale_start_index = torch.arange(cam * scale, dtype=torch.int32, device="cuda").view(cam, scale) * (H * W)
 sampling_location = torch.rand(B, anchor, pts, cam, 2, device="cuda", requires_grad=True)
 weights = torch.rand(B, anchor, pts, cam, scale, numGroups, device="cuda", requires_grad=True)
-
 out = deformable_aggregation_function(
     feature_maps, spatial_shape, scale_start_index, sampling_location, weights
 )
 out.sum().backward()
-
-# 等待前向与反向 Kernel 执行完成
 torch.cuda.synchronize()
-
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
     f"feature_maps.grad shape: {feature_maps.grad.shape}, "

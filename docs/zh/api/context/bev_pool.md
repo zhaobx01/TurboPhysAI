@@ -74,34 +74,24 @@ turbo_physai.ops.bev_pool_prepare_geometry(
 ```python
 import torch
 from turbo_physai import ops
-
 B, D, H, W, C = 1, 4, 128, 128, 64
 N = 1024
-
 x = torch.randn(N, C, device="cuda", dtype=torch.float32)
 geom_feats = torch.empty(N, 4, device="cuda", dtype=torch.int32)
-# geom_feats 每一列分别表示：height、width、depth、batch
-# 各列的取值范围分别为 [0, H)、[0, W)、[0, D)、[0, B)
 geom_feats[:, 0] = torch.randint(0, H, (N,), device="cuda")
 geom_feats[:, 1] = torch.randint(0, W, (N,), device="cuda")
 geom_feats[:, 2] = torch.randint(0, D, (N,), device="cuda")
 geom_feats[:, 3] = torch.randint(0, B, (N,), device="cuda")
-
-# 为坐标 (height, width, depth, batch) 生成排序键
 ranks = (
     ((geom_feats[:, 3].to(torch.int64) * D
       + geom_feats[:, 2].to(torch.int64)) * H
      + geom_feats[:, 0].to(torch.int64)) * W
     + geom_feats[:, 1].to(torch.int64)
 )
-
-# x 和 geom_feats 必须按照同一个 ranks 同步排序
 order = torch.argsort(ranks)
 x = x[order].contiguous()
 geom_feats = geom_feats[order].contiguous()
 ranks = ranks[order].contiguous()
-
-# 计算每个连续坐标区间的起点和长度
 kept = torch.ones(N, device="cuda", dtype=torch.bool)
 kept[1:] = ranks[1:] != ranks[:-1]
 interval_starts = torch.where(kept)[0].to(torch.int32)
@@ -109,7 +99,6 @@ interval_lengths = torch.empty_like(interval_starts)
 if interval_starts.numel() > 1:
     interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
 interval_lengths[-1] = N - interval_starts[-1]
-
 out = ops.bev_pool_forward(
     x,
     geom_feats,
@@ -120,11 +109,7 @@ out = ops.bev_pool_forward(
     H,
     W,
 )
-
-# 显式同步，确保设备端错误在算子调用处报告
 torch.cuda.synchronize()
-
-# 构造输出梯度，并调用原生反向算子计算 x 的梯度
 out_grad = torch.ones_like(out)
 x_grad = ops.bev_pool_backward(
     out_grad,
@@ -137,7 +122,6 @@ x_grad = ops.bev_pool_backward(
     W,
 )
 torch.cuda.synchronize()
-
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
     f"x_grad shape: {x_grad.shape}, x_grad dtype: {x_grad.dtype}"

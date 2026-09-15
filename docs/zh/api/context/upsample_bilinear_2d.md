@@ -58,7 +58,6 @@ Python 封装：
 ```python
 import torch
 from turbo_physai import interpolate
-
 input = torch.randn(
     2,
     64,
@@ -68,20 +67,14 @@ input = torch.randn(
     dtype=torch.float32,
     requires_grad=True,
 )
-
-# 前向传播
 out = interpolate(
     input,
     size=(64, 64),
     mode="bilinear",
     align_corners=False,
 )
-
-# 反向传播
 out.sum().backward()
-
 torch.cuda.synchronize()
-
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
     f"input.grad shape: {input.grad.shape}, "

@@ -68,14 +68,12 @@ ops.dynamic_point_to_voxel_backward(
 ```python
 import torch
 from turbo_physai import ops
-
 feats = torch.randn(
     20000,
     32,
     device="cuda",
     dtype=torch.float32,
 )
-
 coors = torch.randint(
     0,
     100,
@@ -83,8 +81,6 @@ coors = torch.randint(
     device="cuda",
     dtype=torch.int32,
 )
-
-# 前向传播
 reduced, out_coors, coors_map, reduce_count = (
     ops.dynamic_point_to_voxel_forward(
         feats,
@@ -92,10 +88,7 @@ reduced, out_coors, coors_map, reduce_count = (
         "max",
     )
 )
-
 torch.cuda.synchronize()
-
-# 反向传播
 grad_feats = torch.empty_like(feats)
 ops.dynamic_point_to_voxel_backward(
     grad_feats,
@@ -106,9 +99,7 @@ ops.dynamic_point_to_voxel_backward(
     reduce_count,
     "max",
 )
-
 torch.cuda.synchronize()
-
 print(
     f"reduced shape: {reduced.shape}, reduced dtype: {reduced.dtype}, "
     f"out_coors shape: {out_coors.shape}, out_coors dtype: {out_coors.dtype}, "

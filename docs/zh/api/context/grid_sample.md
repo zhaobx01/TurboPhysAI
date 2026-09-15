@@ -54,7 +54,6 @@ Python 封装：
 ```python
 import torch
 from turbo_physai import grid_sample
-
 input = torch.randn(
     2,
     32,
@@ -64,7 +63,6 @@ input = torch.randn(
     dtype=torch.float32,
     requires_grad=True,
 )
-
 grid = (
     torch.rand(
         2,
@@ -77,8 +75,6 @@ grid = (
     * 2
     - 1
 ).requires_grad_()
-
-# 前向传播
 out = grid_sample(
     input,
     grid,
@@ -86,12 +82,8 @@ out = grid_sample(
     padding_mode="zeros",
     align_corners=False,
 )
-
-# 反向传播
 out.sum().backward()
-
 torch.cuda.synchronize()
-
 print(
     f"output shape: {out.shape}, output dtype: {out.dtype}, "
     f"input.grad shape: {input.grad.shape}, "

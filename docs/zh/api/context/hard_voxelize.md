@@ -46,18 +46,15 @@ turbo_physai.ops.hard_voxelize(
 ```python
 import torch
 from turbo_physai import ops
-
 points = torch.rand(
     20000,
     3,
     device="cuda",
     dtype=torch.float32,
 ) * 70.0
-
 voxel_size = [0.05, 0.05, 0.1]
 coors_range = [0.0, -40.0, -3.0, 70.4, 40.0, 1.0]
 max_points, max_voxels = 10, 40000
-
 voxels = points.new_zeros(
     (max_voxels, max_points, points.size(1)),
 )
@@ -69,8 +66,6 @@ point_counts = points.new_zeros(
     (max_voxels,),
     dtype=torch.int32,
 )
-
-# 执行硬件体素化
 n = ops.hard_voxelize(
     points,
     voxels,
@@ -83,14 +78,10 @@ n = ops.hard_voxelize(
     3,
     True,
 )
-
-# n 表示实际生成的体素数量
 voxels = voxels[:n]
 coors = coors[:n]
 point_counts = point_counts[:n]
-
 torch.cuda.synchronize()
-
 print(
     f"points shape: {points.shape}, points dtype: {points.dtype}, "
     f"voxels shape: {voxels.shape}, voxels dtype: {voxels.dtype}, "

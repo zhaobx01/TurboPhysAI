@@ -67,8 +67,6 @@ import torch
 from turbo_physai.optimizations.common.mmdet3d.sparse_conv import (
     get_indice_pairs,
 )
-
-# 4 个稀疏激活点，坐标列为 (batch, z, y, x)
 indices = torch.tensor(
     [
         [0, 1, 2, 3],
@@ -79,7 +77,6 @@ indices = torch.tensor(
     dtype=torch.int32,
     device="cuda",
 )
-
 out_inds, indice_pairs, indice_num = get_indice_pairs(
     indices,
     batch_size=1,
@@ -87,9 +84,7 @@ out_inds, indice_pairs, indice_num = get_indice_pairs(
     ksize=3,
     subm=True,
 )
-
 torch.cuda.synchronize()
-
 print(
     f"indices shape: {indices.shape}, indices dtype: {indices.dtype}, "
     f"out_inds shape: {out_inds.shape}, out_inds dtype: {out_inds.dtype}, "

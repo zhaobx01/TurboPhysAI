@@ -36,22 +36,18 @@ turbo_physai.ops.dynamic_voxelize(
 ```python
 import torch
 from turbo_physai import ops
-
 points = torch.rand(
     20000,
     3,
     device="cuda",
     dtype=torch.float32,
 ) * 70.0
-
 coors = points.new_zeros(
     (points.size(0), 3),
     dtype=torch.int32,
 )
 voxel_size = [0.05, 0.05, 0.1]
 coors_range = [0.0, -40.0, -3.0, 70.4, 40.0, 1.0]
-
-# 原地计算每个点对应的体素坐标
 ops.dynamic_voxelize(
     points,
     coors,
@@ -59,11 +55,8 @@ ops.dynamic_voxelize(
     coors_range,
     3,
 )
-
-# 过滤越界点
 torch.cuda.synchronize()
 valid = coors[:, 0] >= 0
-
 print(
     f"points shape: {points.shape}, points dtype: {points.dtype}, "
     f"coors shape: {coors.shape}, coors dtype: {coors.dtype}, "

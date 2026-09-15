@@ -57,8 +57,6 @@ from turbo_physai import ops
 from turbo_physai.optimizations.common.mmdet3d.sparse_conv import (
     get_indice_pairs,
 )
-
-# 4 个稀疏激活点，坐标列为 (batch, z, y, x)
 indices = torch.tensor(
     [
         [0, 1, 2, 3],
@@ -69,8 +67,6 @@ indices = torch.tensor(
     dtype=torch.int32,
     device="cuda",
 )
-
-# 生成稀疏卷积所需的索引对
 out_inds, indice_pairs, indice_num = get_indice_pairs(
     indices,
     batch_size=1,
@@ -78,7 +74,6 @@ out_inds, indice_pairs, indice_num = get_indice_pairs(
     ksize=3,
     subm=True,
 )
-
 features = torch.randn(
     4,
     16,
@@ -94,8 +89,6 @@ filters = torch.randn(
     device="cuda",
     dtype=torch.float32,
 )
-
-# 前向传播
 out = ops.indice_conv_fp32(
     features,
     filters,
@@ -105,10 +98,7 @@ out = ops.indice_conv_fp32(
     0,
     1,
 )
-
 torch.cuda.synchronize()
-
-# 反向传播
 grad_features, grad_filters = ops.indice_conv_backward_fp32(
     features,
     filters,
@@ -118,9 +108,7 @@ grad_features, grad_filters = ops.indice_conv_backward_fp32(
     0,
     1,
 )
-
 torch.cuda.synchronize()
-
 print(
     f"features shape: {features.shape}, features dtype: {features.dtype}, "
     f"filters shape: {filters.shape}, filters dtype: {filters.dtype}, "
