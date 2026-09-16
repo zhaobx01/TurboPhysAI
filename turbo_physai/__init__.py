@@ -57,6 +57,49 @@ _LAZY_OPERATORS = {
         "turbo_physai.operators.deformable_aggregation",
         "DeformableAggregationFunction",
     ),
+    "bev_pool": ("turbo_physai.operators.bev_pool", "bev_pool"),
+    "bev_pool_forward": (
+        "turbo_physai.operators.bev_pool",
+        "bev_pool_forward",
+    ),
+    "bev_pool_backward": (
+        "turbo_physai.operators.bev_pool",
+        "bev_pool_backward",
+    ),
+    "bev_pool_prepare": (
+        "turbo_physai.operators.bev_pool",
+        "bev_pool_prepare",
+    ),
+    "bev_pool_prepare_geometry": (
+        "turbo_physai.operators.bev_pool",
+        "bev_pool_prepare_geometry",
+    ),
+    "voxelization_forward": (
+        "turbo_physai.operators.voxelization",
+        "voxelization_forward",
+    ),
+    "voxelize": ("turbo_physai.operators.voxelization", "voxelize"),
+    "dynamic_voxelize": (
+        "turbo_physai.operators.voxelization",
+        "dynamic_voxelize",
+    ),
+    "hard_voxelize": (
+        "turbo_physai.operators.voxelization",
+        "hard_voxelize",
+    ),
+    "get_indice_pairs": (
+        "turbo_physai.operators.sparse_conv",
+        "get_indice_pairs",
+    ),
+    "dynamic_scatter": (
+        "turbo_physai.operators.voxelization",
+        "dynamic_scatter",
+    ),
+    "indice_conv": ("turbo_physai.operators.sparse_conv", "indice_conv"),
+    "indice_maxpool": (
+        "turbo_physai.operators.sparse_conv",
+        "indice_maxpool",
+    ),
 }
 
 

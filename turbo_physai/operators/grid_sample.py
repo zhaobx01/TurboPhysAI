@@ -6,10 +6,25 @@
 import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
-from turbo_physai.ops import grid_sample_forward, grid_sample_backward
 from typing import Callable, List, Optional, Tuple, Union
 
 Tensor = torch.Tensor
+
+
+def grid_sample_forward(input, grid, interpolation_mode, padding_mode, align_corners):
+    from turbo_physai import ops
+    return ops.grid_sample_forward(
+        input, grid, interpolation_mode, padding_mode, align_corners
+    )
+
+
+def grid_sample_backward(grad_output, input, grid, interpolation_mode,
+                         padding_mode, align_corners, output_mask):
+    from turbo_physai import ops
+    return ops.grid_sample_backward(
+        grad_output, input, grid, interpolation_mode, padding_mode,
+        align_corners, output_mask
+    )
 
 class GridSampleFunction(Function):
     @staticmethod

@@ -8,7 +8,24 @@
 import torch
 from torch.autograd.function import Function, once_differentiable
 
-from turbo_physai.ops import deformable_aggregation_forward, deformable_aggregation_backward
+def deformable_aggregation_forward(
+    mc_ms_feat, spatial_shape, scale_start_index, sampling_location, weights
+):
+    from turbo_physai import ops
+    return ops.deformable_aggregation_forward(
+        mc_ms_feat, spatial_shape, scale_start_index, sampling_location, weights
+    )
+
+
+def deformable_aggregation_backward(
+    mc_ms_feat, spatial_shape, scale_start_index, sampling_location, weights,
+    grad_output, grad_mc_ms_feat, grad_sampling_location, grad_weights,
+):
+    from turbo_physai import ops
+    return ops.deformable_aggregation_backward(
+        mc_ms_feat, spatial_shape, scale_start_index, sampling_location, weights,
+        grad_output, grad_mc_ms_feat, grad_sampling_location, grad_weights,
+    )
 
 
 class DeformableAggregationFunction(Function):

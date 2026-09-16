@@ -6,10 +6,25 @@
 import torch
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
-from turbo_physai.ops import upsample_bilinear_2d_forward, upsample_bilinear_2d_backward
 from typing import Callable, List, Optional, Tuple, Union
 
 Tensor = torch.Tensor
+
+
+def upsample_bilinear_2d_forward(input, output_size=None, align_corners=False,
+                                 scale_factors=None):
+    from turbo_physai import ops
+    return ops.upsample_bilinear_2d_forward(
+        input, output_size, align_corners, scale_factors
+    )
+
+
+def upsample_bilinear_2d_backward(grad_output, output_size, input_size,
+                                  align_corners=False, scale_factors=None):
+    from turbo_physai import ops
+    return ops.upsample_bilinear_2d_backward(
+        grad_output, output_size, input_size, align_corners, scale_factors
+    )
 
 class UpSampleBilinear2dFunction(Function):
     @staticmethod
