@@ -8,7 +8,7 @@ turbo_physai.ops.dynamic_voxelize(
 ) -> None
 ```
 
-接口位置：`turbo_physai.ops`。上层封装见 `turbo_physai/optimizations/common/mmdet3d/voxelization.py`。
+接口位置：`turbo_physai.ops`。以下示例直接调用 native extension；可选的模型兼容辅助层见 `turbo_physai/operators/voxelization.py`。
 
 ## 功能描述
 
@@ -16,7 +16,7 @@ turbo_physai.ops.dynamic_voxelize(
 
 ## 参数说明
 
-- `points(Tensor)`：float32，shape `[N, F]`。
+- `points(Tensor)`：浮点 Tensor，shape `[N, F]`；CPU 路径支持 float/double/half，GPU 路径按编译后的类型分派支持相应类型。
 - `coors(Tensor)`：**输出缓冲区**，需预先分配，int32，shape `[N, NDim]`。
 - `voxel_size(List[float])`：长度 `NDim`。
 - `coors_range(List[float])`：长度 `2 * NDim`，前半为各维最小值、后半为最大值。

@@ -18,7 +18,7 @@ turbo_physai.ops.bev_pool_prepare_geometry(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]
 ```
 
-接口位置：`turbo_physai.ops`。上层封装见 `turbo_physai/optimizations/common/mmdet3d/bev_pool.py`。
+接口位置：`turbo_physai.ops`。以下示例直接调用 native extension；可选的模型兼容辅助层见 `turbo_physai/operators/bev_pool.py`。
 
 ## 功能描述
 
@@ -48,7 +48,7 @@ turbo_physai.ops.bev_pool_prepare_geometry(
 - `frustum(Tensor)`：float32，shape `[D, H, W, 3]`。
 - `inv_post_rots(Tensor)`：float32，shape `[B, N, 3, 3]`。
 - `post_trans, combine, camera2lidar_trans, extra_rots, extra_trans(Tensor)`：其余几何参数，float32。
-- `boundary_eps(float)`：边界判定容差，Python 封装默认 `1e-3`。
+- `boundary_eps(float)`：边界判定容差，调用示例使用 `1e-3`。
 
 ## 返回值
 
@@ -61,13 +61,13 @@ turbo_physai.ops.bev_pool_prepare_geometry(
 
 ## 约束说明
 
-- `bev_pool_prepare` 与 `bev_pool_prepare_geometry` 校验输入必须是 CUDA/HIP 张量，`geom_feats` 与 `frustum` 必须为 float32；shape 不符合将直接报错。
+- 所有 BEV pool native 接口均面向 CUDA/HIP 张量；`bev_pool_prepare` 与 `bev_pool_prepare_geometry` 另外要求 `geom_feats` 与 `frustum` 为 float32，shape 不符合将直接报错。
 - `bev_pool_forward` 假定 `x` 已按 `ranks` 排序，`interval_starts / interval_lengths` 与排序结果一致，由调用方自行保证。
 - 输出通道数取自 `x.size(1)`，`geom_feats` 只用于定位。
 
 ## 调用示例
 
-排序与池化，参考 `optimizations/common/mmdet3d/bev_pool.py`。当前 Kernel 使用的
+排序与池化，参考 `turbo_physai/operators/bev_pool.py`。当前 Kernel 使用的
 `geom_feats` 布局为 `(height, width, depth, batch)`；输入必须先按照同一组
 `ranks` 排序，使相同 BEV 位置的数据连续排列：
 
@@ -127,9 +127,13 @@ print(
     f"x_grad shape: {x_grad.shape}, x_grad dtype: {x_grad.dtype}"
 )
 ```
+一次运行的输出示例：
+```text
+output shape: torch.Size([1, 4, 128, 128, 64]), output dtype: torch.float32, x_grad shape: torch.Size([1024, 64]), x_grad dtype: torch.float32
+```
 
 ## 参考
 
 - 源码：`kernel/bev_pool/src/bev_pool_cpu.cpp`、`kernel/bev_pool/src/bev_pool_cuda.cu`
-- 上层封装：`turbo_physai/optimizations/common/mmdet3d/bev_pool.py`
+- 可选的模型兼容辅助层：`turbo_physai/operators/bev_pool.py`
 - 返回[算子 API 清单](../README.md)

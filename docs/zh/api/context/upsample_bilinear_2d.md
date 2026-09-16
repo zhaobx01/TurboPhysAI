@@ -11,7 +11,7 @@ turbo_physai.ops.upsample_bilinear_2d_backward(
 ) -> Tensor
 ```
 
-接口位置：`turbo_physai.ops`。该接口直接调用编译后的原生扩展；`turbo_physai.interpolate` 是另行提供的 Python 自动求导封装。
+接口位置：`turbo_physai.ops`。本文接口和示例均直接调用编译后的原生扩展。
 
 ## 功能描述
 
@@ -19,21 +19,11 @@ turbo_physai.ops.upsample_bilinear_2d_backward(
 
 ## 参数说明
 
-Python 封装：
-
 - `input(Tensor)`：shape `[N, C, H_in, W_in]`。
-- `size(int | Tuple[int, int] | None)`：输出尺寸 `(H_out, W_out)`；也可传入标量，由封装扩展为两个空间维度。
-- `scale_factor(float | Tuple[float, float] | None)`：缩放因子。
-- `mode(str)`：仅支持 `"bilinear"`。
-- `align_corners(bool | None)`：为 `True` 时报 `ValueError`；`None` 按 `False` 处理。
-- `recompute_scale_factor(bool | None)`：使用 `scale_factor` 时，若为 `True`，先根据缩放因子确定整数输出尺寸，再依据该输出尺寸进行插值；传入显式 `size` 时不能设为 `True`。
-- `antialias(bool)`：为 `True` 时报 `ValueError`。
-
-原生接口：
 
 - `output_size(List[int] | None)`：长度 2，指定输出尺寸；与 `scale_factors` 二选一。
 - `input_size(List[int])`：反向需知输入尺寸，格式 `[N, C, H_in, W_in]`。
-- `align_corners(bool)`。
+- `align_corners(bool)`；参数为接口兼容而保留，当前 kernel 按固定的 `align_corners=False` 坐标规则计算，调用示例传入 `False`。
 - `scale_factors(List[float] | None)`：长度 2，与 `output_size` 二选一。
 
 ## 返回值
@@ -43,7 +33,7 @@ Python 封装：
 
 ## 约束说明
 
-- Python 封装：`mode` 必须为 `"bilinear"`；`align_corners=True` / `antialias=True` / 非 4D 输入均报错；`size` 与 `scale_factor` 必须传且只能传一个。
+- 原生接口只实现 bilinear 4D 输入；`output_size` 与 `scale_factors` 由 PyTorch native 输出尺寸计算逻辑处理，调用方应二选一；当前实现使用固定的 half-pixel 坐标规则，`align_corners` 参数不会改变实际计算。
 - 内核源码注释提示"目前只针对特定 size 优化，其他 size 可能会 coredump"，使用非常规尺寸需注意验证。
 
 ## 调用示例
@@ -80,6 +70,6 @@ output shape: torch.Size([2, 64, 64, 64]), output dtype: torch.float32, input.gr
 ## 参考
 
 - 源码：`kernel/upsample_bilinear_2d/UpSampleBilinear2d.cu`
-- Python 封装：`turbo_physai/operators/upsample_bilinear_2d.py`
+- 可选的高层兼容层：`turbo_physai/operators/upsample_bilinear_2d.py`
 - 算子测试：`test/test_upsample_bilinear_2d.py`
 - 返回[算子 API 清单](../README.md)

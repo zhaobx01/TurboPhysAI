@@ -11,7 +11,7 @@ turbo_physai.ops.grid_sample_backward(
 ) -> Tuple[Tensor, Tensor]
 ```
 
-接口位置：`turbo_physai.ops`。该接口直接调用编译后的原生扩展；`turbo_physai.grid_sample` 是另行提供的 Python 自动求导封装。
+接口位置：`turbo_physai.ops`。本文接口和示例均直接调用编译后的原生扩展。
 
 ## 功能描述
 
@@ -19,19 +19,17 @@ turbo_physai.ops.grid_sample_backward(
 
 ## 参数说明
 
-Python 封装：
+前向接口：
 
 - `input(Tensor)`：shape `[N, C, H_in, W_in]`。
 - `grid(Tensor)`：shape `[N, H_out, W_out, 2]`，最后一维为归一化坐标 `(x, y)`。
-- `mode(str)`：仅支持 `"bilinear"`。
-- `padding_mode(str)`：`"zeros"` / `"border"` / `"reflection"`。
-- `align_corners(bool | None)`：`None` 时按 `False` 处理并 `warnings.warn`。
-
-原生接口的枚举参数：
-
-- `interpolation_mode(int)`：`0=bilinear`、`1=nearest`、`2=bicubic`；封装内固定传 `0`。
+- `interpolation_mode(int)`：接口保留 `0=bilinear`、`1=nearest`、`2=bicubic` 的枚举值；当前 kernel 仅实现 `0`（bilinear）。
 - `padding_mode(int)`：`0=zeros`、`1=border`、`2=reflection`。
-- `output_mask(List[bool])`：长度 2，分别控制是否输出 `input` 与 `grid` 的梯度；Python 封装始终传 `[True, True]`。
+- `align_corners(bool)`。
+
+反向接口参数：
+
+- `output_mask(List[bool])`：长度 2，分别控制是否输出 `input` 与 `grid` 的梯度。
 
 ## 返回值
 
@@ -40,8 +38,8 @@ Python 封装：
 
 ## 约束说明
 
-- Python 封装仅接受 4 维 `input` 与 `grid`、`mode="bilinear"`、`padding_mode ∈ {"zeros", "border", "reflection"}`；不符合直接 `ValueError`。
-- 如需只求 `input` 或 `grid` 单方梯度，直接调原生 `grid_sample_backward` 并调整 `output_mask`。
+- 当前 kernel 仅实现 2D bilinear；原生接口不负责字符串模式转换、参数整理或自动求导，调用方需自行保证输入形状、dtype、设备和连续性。
+- 如需只求 `input` 或 `grid` 单方梯度，可调整 `output_mask`。
 
 ## 调用示例
 
@@ -90,6 +88,6 @@ output shape: torch.Size([2, 32, 128, 128]), output dtype: torch.float32, input.
 ## 参考
 
 - 源码：`kernel/grid_sample/GridSampler.cu`
-- Python 封装：`turbo_physai/operators/grid_sample.py`
+- 可选的高层兼容层：`turbo_physai/operators/grid_sample.py`
 - 算子测试：`test/test_grid_sample.py`
 - 返回[算子 API 清单](../README.md)

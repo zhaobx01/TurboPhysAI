@@ -15,7 +15,7 @@ turbo_physai.ops.get_indice_pairs_grid_3d(
 ) -> Tuple[Tensor, Tensor, Tensor]
 ```
 
-接口位置：`turbo_physai.ops`。下面的调用直接使用原生扩展；Python 辅助封装见 `turbo_physai/optimizations/common/mmdet3d/sparse_conv.py`。
+接口位置：`turbo_physai.ops`。下面的调用直接使用原生扩展；参数广播和输出形状需要由调用方自行准备。
 
 ## 功能描述
 
@@ -28,7 +28,7 @@ turbo_physai.ops.get_indice_pairs_grid_3d(
 - `out_spatial_shape(list[int])`：输出空间形状，由调用方提前计算。
 - `spatial_shape(list[int])`：输入空间形状，长度 `NDim`。
 - `kernel_size / stride / padding / dilation / out_padding`：长度均为 `NDim` 的列表。
-- `subm / transpose(int)`：`0` / `1`。
+- `subm / transpose(int)`：`0` / `1`；这是 native binding 的整数开关，不是 Python `bool` 参数。
 - `grid(Tensor)`：int32，长度 `batch_size * prod(out_spatial_shape)`，元素为输出激活下标或 `-1`。
 
 ## 返回值
@@ -42,7 +42,7 @@ turbo_physai.ops.get_indice_pairs_grid_3d(
 - 同时提供 CPU 与 HCU（ROCm/HIP）实现。
 - `NDim` 必须等于 `indices.size(1) - 1`；所有尺寸列表长度必须为 `NDim`。
 - `kernelVolume = prod(kernel_size)` 必须 `<= 4096`。
-- Python 封装约束：`stride` 与 `dilation` 不能同时大于 1；只支持 `NDim ∈ {2, 3, 4}`（grid 变体仅 `{2, 3}`）。
+- 原生接口只支持 `NDim ∈ {2, 3, 4}`（grid 变体仅 `{2, 3}`）；调用方需自行保证各参数列表长度和输出形状正确。
 - `subm=True` 时内核内部强制 `stride=1`、`padding=kernel_size // 2`，外部传入的这两项会被覆盖。
 - 环境变量 `MMDET3D_SPCONV_CANONICAL_INDICE=1` 会对每个核偏移的索引对做规范化排序，便于结果复现。
 
@@ -94,6 +94,6 @@ indices shape: torch.Size([4, 4]), indices dtype: torch.int32, out_inds shape: t
 ## 参考
 
 - 源码：`kernel/sparse_conv/include/spconv/spconv_ops.h`、`kernel/sparse_conv/src/indice_cpu.cc`、`kernel/sparse_conv/src/indice_cuda.cu`
-- Python 封装：`turbo_physai/optimizations/common/mmdet3d/sparse_conv.py`
+- 可选的模型兼容辅助层：`turbo_physai/operators/sparse_conv.py`
 - 相关接口：[indice_conv](./indice_conv.md)、[indice_maxpool](./indice_maxpool.md)
 - 返回[算子 API 清单](../README.md)

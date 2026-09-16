@@ -10,7 +10,7 @@ turbo_physai.ops.hard_voxelize(
 ) -> int
 ```
 
-接口位置：`turbo_physai.ops`。上层封装见 `turbo_physai/optimizations/common/mmdet3d/voxelization.py`。
+接口位置：`turbo_physai.ops`。以下示例直接调用 native extension；可选的模型兼容辅助层见 `turbo_physai/operators/voxelization.py`。
 
 ## 功能描述
 
@@ -20,7 +20,7 @@ turbo_physai.ops.hard_voxelize(
 
 ## 参数说明
 
-- `points(Tensor)`：float32，shape `[N, F]`，`F` 通常为 3。
+- `points(Tensor)`：浮点 Tensor，shape `[N, F]`，`F` 通常为 3；CPU/GPU 路径的具体类型支持以编译后的类型分派为准。
 - `voxels, coors, num_points_per_voxel(Tensor)`：三个输出缓冲区，由调用方按下列 shape 预分配（原地写入）：
     - `voxels`：`[max_voxels, max_points, F]`，dtype 与 `points` 一致；
     - `coors`：`[max_voxels, 3]`，int32；
@@ -37,7 +37,7 @@ turbo_physai.ops.hard_voxelize(
 
 ## 约束说明
 
-- 同时提供 CPU 与 HCU（ROCm/HIP）实现；GPU 路径要求输入张量连续。
+- 同时提供 CPU 与 HCU（ROCm/HIP）实现；GPU 路径要求输入张量连续，CPU/GPU 支持的具体 dtype 以编译后的 dispatch 为准。
 - 超出 `max_voxels` 的多余体素会被丢弃；越界点不会被写入。
 - HCU 路径默认走排序优化实现，触发条件：`points` 为 float32 二维张量、`max_points > 0`、`max_voxels > 0`、`NDim == 3`。可用 `MMDET3D_DISABLE_VOXELIZE_OPT=1` 关闭，或用 `MMDET3D_VOXELIZE_OPT_MODE` 切换（`off` / `legacy` / `safe` 等）。
 
@@ -101,6 +101,6 @@ points shape: torch.Size([20000, 3]), points dtype: torch.float32, voxels shape:
 ## 参考
 
 - 源码：`kernel/voxelization/src/voxelization.h`、`kernel/voxelization/src/voxelization_cuda.cu`、`kernel/voxelization/src/voxelization_cpu.cpp`
-- 上层封装：`turbo_physai/optimizations/common/mmdet3d/voxelization.py`
+- 可选的模型兼容辅助层：`turbo_physai/operators/voxelization.py`
 - 相关接口：[dynamic_voxelize](./dynamic_voxelize.md)、[dynamic_point_to_voxel](./dynamic_point_to_voxel.md)
 - 返回[算子 API 清单](../README.md)

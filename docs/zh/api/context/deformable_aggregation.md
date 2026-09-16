@@ -80,6 +80,6 @@ output shape: torch.Size([1, 10, 32]), output dtype: torch.float32, feature_maps
 ## 参考
 
 - 源码：`kernel/deformable_aggregation/DeformableAggregation.cu`
-- Python 封装：`turbo_physai/operators/deformable_aggregation.py`
+- 可选的高层兼容层：`turbo_physai/operators/deformable_aggregation.py`
 - 算子测试：`test/test_deformable_aggregation.py`
 - 返回[算子 API 清单](../README.md)

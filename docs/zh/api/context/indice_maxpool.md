@@ -13,7 +13,7 @@ turbo_physai.ops.indice_maxpool_backward_fp32(
 # float16 版本：indice_maxpool_half / indice_maxpool_backward_half
 ```
 
-接口位置：`turbo_physai.ops`，绑定见 `kernel/sparse_conv/src/all.cc`。
+接口位置：`turbo_physai.ops`。以下示例直接调用 native extension；可选的模型兼容辅助层见 `turbo_physai/operators/sparse_conv.py`。native binding 见 `kernel/sparse_conv/src/all.cc`。
 
 ## 功能描述
 
@@ -49,7 +49,6 @@ turbo_physai.ops.indice_maxpool_backward_fp32(
 
 ```python
 import torch
-from turbo_physai import ops
 from turbo_physai import ops
 indices = torch.tensor(
     [

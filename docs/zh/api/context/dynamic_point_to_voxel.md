@@ -20,7 +20,7 @@ ops.dynamic_point_to_voxel_backward(
 ) -> None
 ```
 
-接口位置：`turbo_physai.ops`，语义等价于 MMDetection3D 的 `DynamicScatter`。
+接口位置：`turbo_physai.ops`。以下示例直接调用 native extension；可选的模型兼容辅助层见 `turbo_physai/operators/voxelization.py`。该接口语义等价于 MMDetection3D 的 `DynamicScatter`。
 
 ## 功能描述
 
@@ -111,7 +111,7 @@ print(
 
 一次运行的输出示例：
 ```text
-reduced shape: torch.Size([19815, 32]), reduced dtype: torch.float32, out_coors shape: torch.Size([19815, 3]), out_coors dtype: torch.int32, coors_map shape: torch.Size([20000]), coors_map dtype: torch.int32, reduce_count shape: torch.Size([19815]), reduce_count dtype: torch.int32, grad_feats shape: torch.Size([20000, 32]), grad_feats dtype: torch.float32
+reduced shape: torch.Size([19791, 32]), reduced dtype: torch.float32, out_coors shape: torch.Size([19791, 3]), out_coors dtype: torch.int32, coors_map shape: torch.Size([20000]), coors_map dtype: torch.int32, reduce_count shape: torch.Size([19791]), reduce_count dtype: torch.int32, grad_feats shape: torch.Size([20000, 32]), grad_feats dtype: torch.float32
 ```
 
 ## 参考
