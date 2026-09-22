@@ -31,12 +31,13 @@ try:
 except Exception:  # pragma: no cover - shapely ships with the model stack
     LineString = None
 
-
-class _GridMaskStub:
+_GridMaskBase = torch.nn.Module if torch is not None else object
+class _GridMaskStub(_GridMaskBase):
     """Minimal stand-in for ``GridMask`` so the math can be tested alone."""
 
     def __init__(self, use_h, use_w, rotate=1, offset=False, ratio=0.5,
                  mode=0, prob=1.0):
+        super().__init__()
         self.use_h = use_h
         self.use_w = use_w
         self.rotate = rotate
@@ -450,6 +451,148 @@ class PvMaskDrawingTest(unittest.TestCase):
                     line, 2.5, 0.75, 7.0, -9.0, origin=origin)
                 np.testing.assert_array_equal(
                     np.asarray(one_step.coords), np.asarray(two_step.coords))
+
+
+@unittest.skipIf(torch is None, "torch is required for bev_pool_fix tests")
+class BevPoolFixTest(unittest.TestCase):
+    """Verify that ``base_transform_bev_pool`` produces the correct output shape
+    for both CUDA layout ``[B, C, Z, H, W]`` and ROCm layout ``[B, Z, H, W, C]``
+    returned by the inner ``bev_pool`` call.
+
+    The real ``mmdet3d.ops.bev_pool`` is replaced with a stub that returns a
+    pre-built tensor of the desired layout so the test runs without HCU hardware
+    or the model stack.
+    """
+
+    # Grid dimensions matching a typical MapTRv2 config (nx=[200,100,1], C=256).
+    B, N, D, H_in, W_in, C = 2, 6, 1, 8, 8, 4
+    NX0, NX1, NX2 = 10, 10, 1  # nx[0], nx[1], nx[2] (x, y, z bins)
+
+    def _make_self(self):
+        """Minimal stub standing in for a ``BaseTransform`` instance."""
+        import torch as _torch
+
+        stub = types.SimpleNamespace(
+            C=self.C,
+            nx=_torch.tensor([self.NX0, self.NX1, self.NX2]),
+            bx=_torch.tensor([0.0, 0.0, 0.0]),
+            dx=_torch.tensor([1.0, 1.0, 1.0]),
+        )
+        return stub
+
+    def _make_inputs(self):
+        """Return ``(geom_feats, x)`` with shapes the real method expects."""
+        import torch as _torch
+
+        Nprime = self.B * self.N * self.D * self.H_in * self.W_in
+        x = _torch.zeros(self.B, self.N, self.D, self.H_in, self.W_in, self.C)
+        # geom_feats must survive the bounds filter; put everything at (1,1,0).
+        geom_feats = _torch.ones(self.B, self.N, self.D, self.H_in, self.W_in, 3)
+        return geom_feats, x
+
+    def _expected_output_shape(self):
+        # collapse Z: C * nx[2] channels, spatial H=nx[1], W=nx[0]
+        return (self.B, self.C * self.NX2, self.NX1, self.NX0)
+
+    def _run_with_stub_layout(self, layout):
+        """Patch ``_bev_pool`` inside ``bev_pool_fix`` to return *layout* and
+        call ``base_transform_bev_pool``; return the output tensor."""
+        import torch as _torch
+        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+
+        self_stub = self._make_self()
+        geom_feats, x = self._make_inputs()
+
+        if layout == "NCHW":
+            # [B, C, Z, H, W] — what CUDA bev_pool returns
+            stub_out = _torch.zeros(
+                self.B, self.C, self.NX2, self.NX1, self.NX0)
+        elif layout == "NHWC":
+            # [B, Z, H, W, C] — what ROCm/HIP bev_pool returns
+            stub_out = _torch.zeros(
+                self.B, self.NX2, self.NX1, self.NX0, self.C)
+        else:
+            raise ValueError(layout)
+
+        with unittest.mock.patch.object(
+            bev_pool_fix, "_bev_pool", return_value=stub_out
+        ):
+            return bev_pool_fix.base_transform_bev_pool(self_stub, geom_feats, x)
+
+    def test_cuda_layout_nchw_produces_correct_shape(self):
+        out = self._run_with_stub_layout("NCHW")
+        self.assertEqual(tuple(out.shape), self._expected_output_shape())
+
+    def test_rocm_layout_nhwc_produces_correct_shape(self):
+        out = self._run_with_stub_layout("NHWC")
+        self.assertEqual(tuple(out.shape), self._expected_output_shape())
+
+    def test_both_layouts_produce_identical_output(self):
+        """A zero-filled BEV grid collapses to zeros regardless of layout;
+        verify the two paths agree element-wise for a non-trivial tensor."""
+        import torch as _torch
+        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+
+        self_stub = self._make_self()
+        geom_feats, x = self._make_inputs()
+
+        base = _torch.arange(
+            self.B * self.C * self.NX2 * self.NX1 * self.NX0,
+            dtype=_torch.float32,
+        ).reshape(self.B, self.C, self.NX2, self.NX1, self.NX0)
+
+        nchw_out = None
+        nhwc_out = None
+
+        with unittest.mock.patch.object(
+            bev_pool_fix, "_bev_pool", return_value=base.clone()
+        ):
+            nchw_out = bev_pool_fix.base_transform_bev_pool(
+                self_stub, geom_feats, x)
+
+        nhwc_base = base.permute(0, 2, 3, 4, 1).contiguous()
+        with unittest.mock.patch.object(
+            bev_pool_fix, "_bev_pool", return_value=nhwc_base
+        ):
+            nhwc_out = bev_pool_fix.base_transform_bev_pool(
+                self_stub, geom_feats, x)
+
+        torch.testing.assert_close(nchw_out, nhwc_out, rtol=0, atol=0)
+
+    def test_permute_guard_triggers_only_for_nhwc(self):
+        """The permute guard must fire for NHWC (last dim == C) and stay silent
+        for NCHW (last dim == nx[0], not C when nx[0] != C)."""
+        import torch as _torch
+        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+
+        self_stub = self._make_self()
+        geom_feats, x = self._make_inputs()
+
+        nchw_stub = _torch.zeros(self.B, self.C, self.NX2, self.NX1, self.NX0)
+        nhwc_stub = _torch.zeros(self.B, self.NX2, self.NX1, self.NX0, self.C)
+
+        # NCHW: last dim is NX0 (10), not C (4) — guard must not fire
+        self.assertNotEqual(self.NX0, self.C,
+                            "test requires NX0 != C to distinguish layouts")
+        self.assertEqual(nchw_stub.shape[-1], self.NX0)
+
+        # NHWC: last dim is C — guard fires and permutes to NCHW
+        self.assertEqual(nhwc_stub.shape[-1], self.C)
+
+        with unittest.mock.patch.object(
+            bev_pool_fix, "_bev_pool", return_value=nchw_stub
+        ):
+            nchw_out = bev_pool_fix.base_transform_bev_pool(
+                self_stub, geom_feats, x)
+
+        with unittest.mock.patch.object(
+            bev_pool_fix, "_bev_pool", return_value=nhwc_stub
+        ):
+            nhwc_out = bev_pool_fix.base_transform_bev_pool(
+                self_stub, geom_feats, x)
+
+        self.assertEqual(tuple(nchw_out.shape), self._expected_output_shape())
+        self.assertEqual(tuple(nhwc_out.shape), self._expected_output_shape())
 
 
 if __name__ == "__main__":

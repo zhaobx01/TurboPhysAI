@@ -182,8 +182,22 @@ EFFICIENTNET = group(
     ),
 )
 
+BEV_POOL_FIX = group(
+    "maptrv2.bev_pool_fix",
+    replace(
+        target=(
+            "projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization"
+            ".bev_pool_fix.base_transform_bev_pool"
+        ),
+    ),
+)
+
 __all__ = [
     "ASSIGNER",
+    "BEV_POOL_FIX",
     "COMPILE",
     "DATA",
     "EFFICIENTNET",

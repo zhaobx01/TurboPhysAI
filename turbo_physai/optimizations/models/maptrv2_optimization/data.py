@@ -20,8 +20,10 @@
 The validated reference implementation flips ``pin_memory`` from ``False`` to
 ``True`` in ``projects.mmdet3d_plugin/datasets/builder.build_dataloader`` so the
 host-to-device copies can be issued from pinned memory and overlap with the
-previous step's kernels.  Everything else is kept byte-for-byte identical to the
-official builder.
+previous step's kernels.  The replacement also selects the worker start method
+at the point where the ``DataLoader`` is created.  A late global
+``set_start_method`` call is not sufficient after ``torchrun`` has already
+established its multiprocessing context.
 """
 
 import os
@@ -29,6 +31,7 @@ import random
 from functools import partial
 
 import numpy as np
+import torch
 from mmcv.parallel import collate
 from mmcv.runner import get_dist_info
 from mmdet.datasets.samplers import GroupSampler
@@ -47,6 +50,33 @@ def _pin_memory_enabled():
     return os.getenv("TURBO_PHYSAI_PIN_MEMORY", "1") != "0"
 
 
+def _env_flag(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no"}
+
+
+def _dataloader_multiprocessing_context():
+    """Return the explicit worker context requested by the runtime config.
+
+    ``fork`` avoids pickling the dataset when workers are started. This is
+    required for MapTRv2 datasets that contain ``dict_keys`` views, which
+    ``spawn`` cannot serialize. Set ``TURBO_PHYSAI_FORK_START_METHOD=0`` or
+    ``TURBO_PHYSAI_DATALOADER_START_METHOD=default`` to restore the native
+    ``DataLoader`` behavior.
+    """
+
+    if not _env_flag("TURBO_PHYSAI_FORK_START_METHOD", True):
+        return None
+    start_method = os.getenv(
+        "TURBO_PHYSAI_DATALOADER_START_METHOD", "fork"
+    ).strip().lower()
+    if start_method in {"", "default", "none"}:
+        return None
+    return torch.multiprocessing.get_context(start_method)
+
+
 def build_dataloader(dataset,
                      samples_per_gpu,
                      workers_per_gpu,
@@ -57,7 +87,14 @@ def build_dataloader(dataset,
                      shuffler_sampler=None,
                      nonshuffler_sampler=None,
                      **kwargs):
-    """Build a PyTorch DataLoader with pinned host memory."""
+    """Build a PyTorch DataLoader with pinned host memory.
+
+    The worker context is chosen here instead of relying on a global
+    ``set_start_method`` call in ``custom_train_detector``. At that point
+    ``torchrun`` has already created the process context, so selecting the
+    context explicitly is the only reliable way to keep ``spawn`` from
+    pickling the MapTRv2 dataset object.
+    """
 
     rank, world_size = get_dist_info()
     if dist:
@@ -96,6 +133,10 @@ def build_dataloader(dataset,
         seed=seed) if seed is not None else None
 
     kwargs.setdefault("pin_memory", _pin_memory_enabled())
+    if num_workers > 0:
+        context = _dataloader_multiprocessing_context()
+        if context is not None:
+            kwargs["multiprocessing_context"] = context
 
     data_loader = DataLoader(
         dataset,

@@ -26,6 +26,7 @@ EXPECTED_GROUPS = {
     "maptrv2.pv_mask": Mechanism.REPLACE,
     "maptrv2.assigner": Mechanism.WRAPPER,
     "maptrv2.efficientnet": Mechanism.REGISTRY_OVERRIDE,
+    "maptrv2.bev_pool_fix": Mechanism.REPLACE,
 }
 
 # Groups whose members must re-check an optional dependency on every call.
@@ -49,7 +50,7 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(
             sorted(catalog.__all__),
             [
-                "ASSIGNER", "COMPILE", "DATA", "EFFICIENTNET",
+                "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA", "EFFICIENTNET",
                 "GRID_MASK", "MATCH_COST", "PV_MASK",
                 "TRAINING",
             ],
@@ -112,6 +113,10 @@ class CatalogTest(unittest.TestCase):
         self.assertIn(
             "projects.mmdet3d_plugin.maptr.assigners.maptr_assigner."
             "MapTRAssigner.assign",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool",
             targets,
         )
 

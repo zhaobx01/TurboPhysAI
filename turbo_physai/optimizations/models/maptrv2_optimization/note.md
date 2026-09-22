@@ -109,6 +109,8 @@ class TransposeImage:
 
 **优点**：`benchmark=True` 让 cuDNN/MIOpen 挑最快 conv 算法（固定 shape 提速明显）；`deterministic=False` 解锁更快算法；`fork` 让 DataLoader worker 复用父进程已导入的 mmcv/mmdet3d，冷启动更快。
 
+**已知限制**：`set_start_method('fork')` 只在单卡直接跑 `python tools/train.py` 时有效；`torchrun` 多卡场景下这行代码不生效，`DataLoader` 会退回默认的 `spawn`，进而在 pickle dataset 时报错（原因和修法见 U5）。TurboPhysAI 的做法是不依赖这个全局调用，而是在 `data.py` 的 `build_dataloader()` 里给每个 `DataLoader` 单独传 `multiprocessing_context`，创建时直接生效，不受 `torchrun` 影响。
+
 #### B3. DataLoader `pin_memory=True`
 
 `projects/mmdet3d_plugin/datasets/builder.py`
@@ -366,6 +368,24 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 **优点**：允许 cuBLAS / hipBLASLt 在 fp32 GEMM 上选 TF32 等同级内核，`LSSTransform`里的 `torch.matmul`（`matmul_1/2/3`、`get_geometry`、`bev_pool`）与 attention 的`QK^T` / `PV` 直接受益，精度损失通常在小数点后 3 位量级。**归属**：TurboPhysAI 收进
 `maptrv2.training`（`training.py` 的 `_matmul_precision`），默认 `high`，可用`TURBO_PHYSAI_MATMUL_PRECISION=off` 回到 torch 默认的 `highest`。
 
+#### B13. lightop DCU 自定义 Deformable Attention Kernel
+
+`projects/mmdet3d_plugin/bevformer/modules/multi_scale_deformable_attn_function.py`
+
+```diff
+-from mmcv import _ext as ext_module
++try:
++    from lightop import op as ext_module   # Hygon DCU 优化的 MS-Deformable-Attn 算子
++except ImportError:
++    from mmcv import _ext as ext_module    # fallback 到 mmcv 原版
+```
+
+同文件中 `im2col_step` 由关键字传参改为位置传参，避免 Python 关键字查找开销。
+
+**优点**：`lightop` 是 Hygon 针对 DCU 优化的 MS-Deformable-Attention CUDA 扩展，性能优于 mmcv 通用实现；`try/except` 保证在 lightop 未安装时自动 fallback 到 mmcv，不影响可移植性。
+
+**归属**：这是运行时 import 级别的替换，写在模型源码中。TurboPhysAI 的通用 `mmcv.msda` Group patch 的是 mmcv 层的符号，与 lightop 是不同路径；若 lightop 已安装则 mmcv.msda 不会在关键路径生效。**当前未通过 TurboPhysAI recipe 管理**，属于需要随模型源码部署 lightop 库的硬件适配项。
+
 ---
 
 ## 2. TurboPhysAI 接入与注册
@@ -400,7 +420,7 @@ maptrv2_optimization/
 │   ├── catalog.py                   # Group 声明（唯一注册入口）
 │   ├── compat.py                    # runtime_condition 与能力探测（懒加载 torch）
 │   ├── training.py                  # B1/B2：channels-last、cuDNN、fork
-│   ├── data.py                      # B3：build_dataloader(pin_memory=True)
+│   ├── data.py                      # B3 + fork 修复：pin_memory、DataLoader 级 multiprocessing_context
 │   ├── grid_mask.py                 # B4：Dynamo 安全的 GridMask.forward
 │   ├── compile.py                   # B5/B7：compile_wrapper / dynamo_disable_wrapper
 │   ├── match_cost.py                # B6：cdist(p=1) → 广播减法
@@ -839,12 +859,16 @@ HCU/DCU 上机验证
   generate/check -> 短训练 -> loss/mAP 与性能 A/B
 ```
 
-仓库级 `test/optimizations/` 当前包含两个文件：
+仓库级 `test/optimizations/` 当前包含三个文件：
 
 - `test_maptrv2_catalog.py`：检查全部 Group、registry/`__all__` 一致性、可选 Group 的
   condition 与成员数、condition 契约和 `target` 是否存在，并断言导入 catalog 不会拉起 torch。
 - `test_maptrv2_implementations.py`：覆盖 channels-last 作用域、`OrderedPtsL1Cost` 与
-  `torch.cdist(p=1)` 数值等价、GridMask 只读缓冲区，以及 PV mask/几何变换与官方结果一致。
+  `torch.cdist(p=1)` 数值等价、GridMask 只读缓冲区、PV mask/几何变换与官方结果一致，以及
+  `bev_pool_fix` 对 NCHW/NHWC 两种 layout 的输出形状回归（§3.7.1/U3）。
+- `test_maptrv2_data.py`：对 `build_dataloader()` 打桩 `mmcv`/`mmdet`/`projects.*` 依赖，验证
+  默认 `fork` context、显式 `spawn` 覆盖、`TURBO_PHYSAI_FORK_START_METHOD=0` 关闭覆盖三种分支
+  都传给底层 `DataLoader` 正确的 `multiprocessing_context`（§3.7.1/U5）。
 
 测试由 `TurboPhysAI/pytest.ini` 的 `testpaths = test` 收集。需要 HCU/DCU 的用例放在仓库级
 `test/`，并标记为 `@pytest.mark.hcu`。
@@ -855,7 +879,8 @@ HCU/DCU 上机验证
 cd /path/to/TurboPhysAI
 
 pytest test/optimizations/test_maptrv2_catalog.py \
-       test/optimizations/test_maptrv2_implementations.py
+       test/optimizations/test_maptrv2_implementations.py \
+       test/optimizations/test_maptrv2_data.py
 
 turbo-physai optimization generate \
   --recipe turbo_physai/optimizations/models/maptrv2_optimization/configs/recipe.yaml \
@@ -920,7 +945,8 @@ loss 曲线和 nuScenes mAP，并记录性能数据。
 | NUMA rank 绑定 | B11 | 已映射到 RuntimeConfig `process.numa` |
 | `set_float32_matmul_precision("high")` | B12 | 已接入 `maptrv2.training` |
 | head 中 `get_label_result`、`pad_to_static_list` 抽取 | B7、§4.13 | **未接入**，属于静态 assigner 的同一批跨文件改造 |
-| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5、§4.12 | **未接入**；普通 `maptrv2.compile` 覆盖不到，参考实现是把 collapse Z 从 `bev_pool` 移到新的 `down_sample` |
+| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5、§4.12 | **部分接入**：ROCm `bev_pool` 实际返回 `[B,Z,H,W,C]` 而非 CUDA 的 `[B,C,Z,H,W]`，导致后续 `downsample` Conv2d channel 维不匹配崩溃。已通过 `maptrv2.bev_pool_fix`（`bev_pool_fix.py`）在 monkey-patch 层修正 layout，不改动 `encoder.py`；参考实现的「把 collapse Z 移入新 `down_sample`」编译优化仍未接入 |
+| `lightop` DCU Deformable Attention 算子替换 | B13 | **未接入 TurboPhysAI recipe**：以 try/except 写在模型源码中；`mmcv.msda` 替换的是 mmcv 层符号，与 lightop 路径不重叠 |
 
 #### 3.6.2 `mmdetection3d` 与部署层
 
@@ -944,20 +970,19 @@ loss 曲线和 nuScenes mAP，并记录性能数据。
 └──  1 个 assigner 挂点    部分接入；当前仅做 dynamo.disable，静态打包未实现
 
 MapTRv2 专属优化
-├── 已接入：training / data / grid_mask / match_cost / pv_mask / efficientnet
+├── 已接入：training / data / grid_mask / match_cost / pv_mask / efficientnet / bev_pool_fix
 ├── 部分接入：compile / assigner
-└── 未接入：8 个 helper、assigner 静态契约、bev_pool+down_sample、
-             LineString 拷贝消除、CUDAExtension 强制构建
+└── 未接入：8 个 helper、assigner 静态契约、bev_pool+down_sample 完整重构、
+             LineString 拷贝消除、CUDAExtension 强制构建、lightop 算子替换
 
 mmdetection3d 与部署层
 ├── 通用优化：通过 common.hcu.base 接入一部分
 └── 参考特有构建/契约改动：多数尚未迁移
 ```
 
-因此当前不能表述为“权威优化版已经全部剥离并接入”。若目标是完全对齐参考实现，仍需补：
-8 个 compile 边界、assigner 全链路静态化、`bev_pool`/`down_sample` 契约改造、
-`CUDAExtension` 强制构建，以及 mmdet3d 的 SparseConv 注册和构建兼容项。若只追求不修改
-模型源码的安全优化，则现有 `maptrv2.*` 六个默认开启 Group 可以作为第一阶段，但 compile
+因此当前不能表述为”权威优化版已经全部剥离并接入”。若目标是完全对齐参考实现，仍需补：
+8 个 compile 边界、assigner 全链路静态化、`bev_pool`/`down_sample` 完整重构（ROCm layout 修正已通过 `maptrv2.bev_pool_fix` 接入）、`CUDAExtension` 强制构建、lightop 算子替换，以及 mmdet3d 的 SparseConv 注册和构建兼容项。若只追求不修改
+模型源码的安全优化，则现有 `maptrv2.*` 七个默认开启 Group 可以作为第一阶段，但 compile
 与 assigner 只能算部分对齐。
 
 ### 3.7 未接入与部分接入项
@@ -1026,33 +1051,56 @@ def large_forward():
 
 未接入原因：基线不存在这些新符号。`replace(target=...)` 要求目标符号已经存在，不能凭空插入Helper。若改为编译原来的大方法，又会把 Python 循环、list、numpy 交互和配置分支一起带入，导致多个 graph break，因此需要先修改模型源码重新切计算边界。
 
-**U3. `bev_pool` / `down_sample` 布局契约（未接入）**
+**U3. `bev_pool` ROCm layout 修正（已接入）**
 
-这项优化主要改变中间 tensor 的传递方式，并没有减少计算步骤。
+ROCm/HIP 的 `bev_pool` 返回 `[B, Z, H, W, C]`（channels-last），而 CUDA 版本返回
+`[B, C, Z, H, W]`（NCHW）。原始 `BaseTransform.bev_pool` 直接在 dim=2 做 `unbind` 展开 Z
+轴，ROCm 下实际切到的是 H 维，产出形状变成 `[B, 200, 400, C]`，接进 `LSSTransform` 的
+`self.downsample`（`Conv2d(256,256,3,3)`）后 channel 数不匹配，抛出：
 
-```text
-基线：
-bev_pool 返回 [B, C, Z, H, W]
-    -> BaseTransform 做 collapse Z + permute
-    -> LSSTransform 调 downsample
+```
+RuntimeError: Given groups=1, weight of size [256, 256, 3, 3],
+expected input[4, 200, 256, 400] to have 256 channels, but got 200 channels instead
 ```
 
-参考实现把这段逻辑集中到新的 `LSSTransform.down_sample`，再统一编译：
+**接入方式**：新增 `bev_pool_fix.py`，完整复制 `BaseTransform.bev_pool` 逻辑并在
+`bev_pool()` 调用之后插入 layout 检测与修正：
 
-```text
-参考实现：
-bev_pool 返回 5D [B, Z, H, W, C]
-    -> BaseTransform 原样传递
-    -> down_sample 统一完成
-       permute + collapse Z + downsample
+```python
+x = _bev_pool(x, geom_feats, B, self.nx[2], self.nx[0], self.nx[1])
+
+# ROCm/HIP bev_pool 返回 [B, Z, H, W, C]；CUDA 返回 [B, C, Z, H, W]
+if x.dim() == 5 and x.shape[-1] == self.C:
+    x = x.permute(0, 4, 1, 2, 3).contiguous()
+
+final = torch.cat(x.unbind(dim=2), 1)
 ```
 
-作用：把分散在多个函数中的布局转换集中到一个编译区域，减少 Python 调用边界，并便于编译器
-优化布局操作与后续卷积。
+`catalog.py` 注册 `maptrv2.bev_pool_fix` group，通过 `replace` 在模型实例化前把
+`BaseTransform.bev_pool` 换成修正版；`recipe.yaml` 和 `configs/optimization.yaml` 均设为
+`enabled: true`。`encoder.py` 全程未改动。
 
-未接入原因：`bev_pool`、`BaseTransform` 和 `LSSTransform` 必须同时改成使用 5D 中间格式。
-任意一处仍返回 4D，后续 `permute` 或 downsample 就会拿到错误维度。TurboPhysAI 当前的通用
-`mmdet3d.bev_pool` 仍保持 4D 契约，因此不能单独套用参考实现的 `down_sample`。
+条件 `x.shape[-1] == self.C` 保证 CUDA 路径（`shape[-1] != self.C`）不会误触发，向前兼容。
+
+参考实现的「把 collapse Z 移入新 `down_sample` 并统一编译」优化属于跨函数布局契约重构，
+仍未接入（理由不变，见 §3.7.1/U3 原始说明）。
+
+**启动方式**（须先设置 PYTHONPATH，再通过 TurboPhysAI 包裹启动）：
+
+```bash
+export PYTHONPATH=/workspace/TurboPhysAI:$PYTHONPATH
+
+cd /workspace/model/MapTrv2
+turbo-physai run \
+  --optimization-config /workspace/TurboPhysAI/configs/optimization.yaml \
+  --runtime-config /workspace/TurboPhysAI/turbo_physai/optimizations/models/maptrv2_optimization/configs/runtime.yaml \
+  python tools/train.py projects/configs/maptrv2/maptrv2_nusc_r50_24ep.py \
+  --work-dir work_dirs/maptrv2_optimized
+```
+
+`PYTHONPATH` 优先于系统 `/usr/local/lib/python3.10/dist-packages/turbo_physai/`（该版本缺少
+`maptrv2` model 支持）；`pip install -e` 在无卡构建环境因找不到 `torch` 而失败，因此用
+`PYTHONPATH` 替代。
 
 **U4. Assigner 静态化（部分接入）**
 
@@ -1077,6 +1125,62 @@ assign()  [@torch.compile]
 `sampler.sample` 和 `hungarian_match`。只替换 assigner 会直接 shape/语义不匹配。当前
 `maptrv2.assigner` 只对整个 `assign` 做 `torch._dynamo.disable`，是安全降级，不包含固定
 shape 和编译收益。
+
+**U5. DataLoader `spawn` 下 `dict_keys` pickle 崩溃（已接入）**
+
+`torchrun` 拉起 8 卡分布式训练后，每个 rank 的 `DataLoader` 在创建 worker 子进程时抛出：
+
+```
+File "/usr/lib/python3.10/multiprocessing/reduction.py", line 60, in dump
+    ForkingPickler(file, protocol).dump(obj)
+TypeError: cannot pickle 'dict_keys' object
+```
+
+**根因**：`tools/train.py` 里的 `torch.multiprocessing.set_start_method('fork')` 只在单进程直接
+`python tools/train.py` 时生效（见 B2 已知限制）。`torchrun` 已经把每个 rank 起成独立进程，
+该全局调用在此时不再改变 worker 的启动方式，`DataLoader` 退回 PyTorch 默认的 `spawn`。
+`spawn` 需要把整个 dataset 对象 pickle 后传给 worker，而 nuScenes 的
+`DetectionConfig`（`self.eval_detection_configs`）内部某个字段以 `dict.keys()` 视图形式保存，
+`dict_keys` 不可 pickle，worker 启动阶段直接崩溃。单卡或 `workers_per_gpu=0` 时不触发，因为
+根本没有走到子进程创建。
+
+**接入方式**：`data.py` 新增 `_dataloader_multiprocessing_context()`，在
+`build_dataloader()` 创建 `DataLoader` 的调用点显式传入 `multiprocessing_context`，而不是依赖
+`custom_train_detector` 里已经失效的全局 `set_start_method`：
+
+```python
+def _dataloader_multiprocessing_context():
+    if not _env_flag("TURBO_PHYSAI_FORK_START_METHOD", True):
+        return None
+    start_method = os.getenv(
+        "TURBO_PHYSAI_DATALOADER_START_METHOD", "fork"
+    ).strip().lower()
+    if start_method in {"", "default", "none"}:
+        return None
+    return torch.multiprocessing.get_context(start_method)
+
+...
+if num_workers > 0:
+    context = _dataloader_multiprocessing_context()
+    if context is not None:
+        kwargs["multiprocessing_context"] = context
+```
+
+默认选 `fork`：worker 直接复用父进程已 import 好的 mmcv/mmdet3d 与已构造好的 dataset 对象，
+不走 pickle，`dict_keys` 也就不需要被序列化。保留三档可配置：
+
+| 环境变量 | 行为 |
+| --- | --- |
+| `TURBO_PHYSAI_FORK_START_METHOD=0` | 关闭本项覆盖，`DataLoader` 走 PyTorch 默认行为 |
+| `TURBO_PHYSAI_DATALOADER_START_METHOD=default` | 同上，显式声明恢复原生行为 |
+| `TURBO_PHYSAI_DATALOADER_START_METHOD=spawn` | 显式改用 `spawn`（需要先修掉 dataset 里的 `dict_keys`） |
+
+`runtime.yaml` 中 `TURBO_PHYSAI_DATALOADER_START_METHOD: fork` 只是显式声明默认值；即使该变量
+缺失，`data.py` 的默认值同样是 `fork`。
+
+**归属**：这是 `maptrv2.data`（B3）group 内的追加修正，不是新 group；`catalog.py` 的
+`replace` 目标未变，仍是 `projects.mmdet3d_plugin.datasets.builder.build_dataloader`。回归测试
+见 `test/optimizations/test_maptrv2_data.py`（§3.4）。
 
 #### 3.7.2 Kernel、公共层与镜像
 
@@ -1130,6 +1234,21 @@ class SparseConv2d(...): ...
 未接入原因：这些是构建补丁，不是运行时优化。应由基础镜像或 TurboPhysAI 的 kernel/build
 资产维护，recipe 的 Python 替换无法处理 C++/CUDA 编译条件。
 
+**K4. lightop DCU Deformable Attention 算子替换（未接入）**
+
+参考实现在 `multi_scale_deformable_attn_function.py` 顶部以 try/except 优先加载 Hygon DCU 专用的 `lightop` 库：
+
+```python
+try:
+    from lightop import op as ext_module
+except ImportError:
+    from mmcv import _ext as ext_module
+```
+
+作用：`lightop` 针对 DCU 的 MS-Deformable-Attention 前反向传播做了针对性优化，与 mmcv 通用实现相比在 Hygon 硬件上有明显性能差距。
+
+未接入原因：import 时已经决定加载哪个库；TurboPhysAI 的 replace/wrap 在模块导入之后才介入，无法在 import 层切换后端。`mmcv.msda` Group 替换的是 mmcv `_ext` 的符号，lightop 安装后会绕过该路径。若要通过 TurboPhysAI 管理，需要把 lightop 的前反向实现封装成独立 operator 并注册到 `turbo_physai/operators/`。
+
 #### 3.7.3 低收益项与替代方案
 
 **L1. LineString 拷贝消除（未接入，低收益）**
@@ -1169,21 +1288,21 @@ class TransposeImage:
 
 必须改模型源码或跨文件契约
 ├── 7 个新增 Helper 挂点
-├── bev_pool + down_sample 布局契约
+├── bev_pool + down_sample 完整重构（ROCm layout 修正已通过 bev_pool_fix 接入）
 └── assigner 完整静态化
 
 应放到 Kernel、Common 或镜像层
 ├── CUDAExtension 强制构建
 ├── SparseConv registry override
-└── mmdet3d 构建兼容补丁
+├── mmdet3d 构建兼容补丁
+└── lightop 算子替换（需封装到 turbo_physai/operators/）
 
 收益小或已有安全替代
 ├── LineString 单次拷贝消除
 └── TransposeImage
 ```
 
-因此，当前最需要继续处理的是 7 个新增 Helper 挂点、`bev_pool`/`down_sample` 契约和
-Assigner 完整静态化；随后是 `CUDAExtension` 构建、SparseConv 注册和 mmdet3d 构建兼容。
+因此，当前最需要继续处理的是 7 个新增 Helper 挂点、`bev_pool`/`down_sample` 完整重构（ROCm layout 修正已接入，完整契约改造仍待完成）和 Assigner 完整静态化；随后是 lightop 算子替换、`CUDAExtension` 构建、SparseConv 注册和 mmdet3d 构建兼容。
 10 个同名 `compile` 挂点只需要在目标机型完成 A/B 后由配置启用，不需要再改接入代码。
 
 ---
@@ -1322,6 +1441,38 @@ fork:   父进程 ─┐   已经 import 好了 mmcv/mmdet3d
 ```
 
 必须在 `if __name__ == '__main__':` 最前面设，晚了会踩 "CUDA has been initialized" 报错 —— 因为一旦父进程 `.cuda()` 过，CUDA context 就不能安全 fork。
+
+**`torchrun` 分布式下这个全局调用会失效**
+
+上面这段代码只在单进程 `python tools/train.py` 直接跑时有效。用 `start_mmdet3d.sh` 走
+`torchrun` 拉起 8 卡后，`tools/train.py` 是被 `torchrun` 已经 fork/spawn 出来的子进程里执行的，
+`if __name__ == '__main__':` 最前面那次 `set_start_method('fork')` 要么被 Python 多进程框架
+判定为"进程已有上下文"而静默失败，要么因为顺序问题根本不会在 `DataLoader` 创建 worker 之前
+生效。结果是 `DataLoader` 退回 PyTorch 默认的 `spawn`。
+
+`spawn` 需要把 dataset 对象整个 pickle 后传给 worker 子进程。nuScenes 官方 `DetectionConfig`
+把 `class_names` 存成 `dict.keys()` 视图（见 `nuscenes/eval/detection/config.py`），而
+`dict_keys` 不能被 pickle，8 卡训练一启动就在每个 rank 上炸：
+
+```
+File "/usr/lib/python3.10/multiprocessing/reduction.py", line 60, in dump
+    ForkingPickler(file, protocol).dump(obj)
+TypeError: cannot pickle 'dict_keys' object
+```
+
+单卡、或者把 `workers_per_gpu` 设成 0 不会触发，因为根本没有创建 DataLoader 子进程。
+
+**TurboPhysAI 的等价修正**：不依赖全局 `set_start_method`，而是在 `build_dataloader()` 创建
+每个 `DataLoader` 的调用点显式传入 `multiprocessing_context`（`data.py`，详见
+§3.7.1/U5）。这个上下文对象在 `DataLoader.__init__` 里直接生效，不受 `torchrun` 已建立的
+进程拓扑影响：
+
+```python
+if num_workers > 0:
+    context = _dataloader_multiprocessing_context()   # 默认 fork
+    if context is not None:
+        kwargs["multiprocessing_context"] = context
+```
 
 ---
 
@@ -2150,6 +2301,10 @@ Conv 时间长但 fp16 没提速                channels_last                   
 dataloader worker CPU 饱和、shapely 占 top  numpy 向量化重采样               (§4.10)
 compile 日志刷 "graph break"             _dynamo.disable / padding+mask   (§4.4, §4.7)
 镜像里 import 冲突                      registry force=True               (§4.8)
+Conv2d channel 不匹配、实际 dim 是 H    ROCm bev_pool 返回 NHWC layout，  (§3.7.1/U3)
+  而非 C（如 got 200 channels not 256）     需 maptrv2.bev_pool_fix
+torchrun 多卡起 DataLoader worker 时      spawn 下 dict_keys 不可 pickle， (§3.7.1/U5)
+  TypeError: cannot pickle 'dict_keys' object   需 DataLoader 级 multiprocessing_context=fork
 ```
 
 **3) 一次只改一项**

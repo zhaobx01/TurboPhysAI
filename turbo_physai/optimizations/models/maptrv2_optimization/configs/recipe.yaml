@@ -39,6 +39,9 @@ optimization_groups:
   # EfficientNet may override an already registered backbone entry.
   - id: maptrv2.efficientnet
     enabled: true
+  # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
+  - id: maptrv2.bev_pool_fix
+    enabled: true
   # torch.compile on the extracted pure-tensor hot methods. Enable after the
   # accuracy/throughput A/B on the target machine.
   - id: maptrv2.compile

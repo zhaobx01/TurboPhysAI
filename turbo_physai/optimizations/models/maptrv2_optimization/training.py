@@ -15,16 +15,6 @@
 #
 # Modified by Hygon.
 
-"""MapTRv2 training-runtime recipe.
-
-The validated reference implementation configures the channels-last layout, the
-cuDNN algorithm selection and the DataLoader start method directly inside
-``tools/train.py`` / ``custom_train_detector``.  TurboPhysAI owns the same
-entrypoint through a wrapper so those changes apply without editing the model
-repository.  Every element can be switched off individually through the Group
-``options`` or the matching environment variable.
-"""
-
 import functools
 import os
 
@@ -62,15 +52,6 @@ def _channels_last_scope(options):
 
 
 def _convert_to_channels_last(model, scope):
-    """Move the reference channels-last tensor set to the NHWC layout.
-
-    The reference converts ``model.img_backbone`` in ``tools/train.py`` and the
-    complete model in ``custom_train_detector``; both are offered through
-    ``scope``.  The conversion runs before the original entrypoint moves the
-    model to the device, and ``Tensor.to`` preserves the memory format, so the
-    device tensors keep the NHWC layout.
-    """
-
     import torch
 
     if scope == "model":
@@ -88,8 +69,6 @@ def _convert_to_channels_last(model, scope):
 
 
 def _install_input_layout_hook(backbone):
-    """Feed the backbone NHWC tensors, mirroring the ``TransposeImage`` step."""
-
     import torch
 
     def _pre_hook(_module, inputs):
@@ -107,8 +86,6 @@ def _install_input_layout_hook(backbone):
 
 
 def training_runtime_wrapper(original, options):
-    """Apply the MapTRv2 training-runtime recipe around ``original``."""
-
     import torch
 
     options = dict(options)
@@ -135,10 +112,6 @@ def training_runtime_wrapper(original, options):
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
 
-        # The reference implementation calls this while ``encoder.py`` is
-        # imported, which lets the LSSTransform matrix products use the faster
-        # reduced-precision path.  Default to the reference value and let
-        # ``TURBO_PHYSAI_MATMUL_PRECISION=off`` restore stock numerics.
         precision = _matmul_precision(options)
         if precision not in {"", "off", "none", "default"}:
             setter = getattr(torch, "set_float32_matmul_precision", None)
