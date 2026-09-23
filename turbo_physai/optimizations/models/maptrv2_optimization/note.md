@@ -143,12 +143,9 @@ class TransposeImage:
 
 #### B5. `torch.compile` 计算边界拆分
 
-优化后把内联热点抽成独立方法，并在每个方法上挂 `@torch.compile()`。权威优化版中这 19 处挂点
-**全部处于启用状态**。参考实现使用无参
-`@torch.compile()`；TurboPhysAI 的 recipe 实现默认使用
-`mode="max-autotune-no-cudagraphs"`，两者模式并不完全相同。下面只示意挂点位置：
+优化后把内联热点抽成独立方法，并在每个方法上挂 `@torch.compile()`。权威优化版中这 19 处挂点**全部处于启用状态**。参考实现使用无参
+`@torch.compile()`；TurboPhysAI 的 recipe 实现默认使用`mode="max-autotune-no-cudagraphs"`，两者模式并不完全相同。下面只示意挂点位置：`projects/mmdet3d_plugin/maptr/modules/transformer.py`
 
-`projects/mmdet3d_plugin/maptr/modules/transformer.py`
 ```diff
 +    @torch.compile()
 +    def initialize_queries_and_bev(self, object_query_embed, bev_embed, bs, bev_h, bev_w):
@@ -197,9 +194,43 @@ def down_sample(self, x): ...
      def extract_img_feat(self, img, img_metas, len_queue=None):
 ```
 
-**优点**：`torch.compile` 对"纯张量、无副作用"的小函数图捕获成功率最高；把 host-side
-组装（`torch.tensor(...)`、`.permute`）与算子调用分离后，热点段可以单独编译，也便于
-A/B 开关。
+**优点**：`torch.compile` 对"纯张量、无副作用"的小函数图捕获成功率最高；把 host-side组装（`torch.tensor(...)`、`.permute`）与算子调用分离后，热点段可以单独编译，也便于A/B 开关。
+
+#### B5.1 七个新增 Helper 编译点
+
+U2 的 7 项均采用同一模式：从原先体积较大、混合 Python 控制和张量计算的方法中，把相对独立的张量逻辑抽成小方法，再在方法上挂 `@torch.compile()`，外层方法只负责选择参数并调用 helper。可减少 graph break、缩小 Dynamo 图并增加算子融合机会。`down_sample` 不计入这 7 项，见 U3。
+
+| # | 新增 Helper | 原内联位置与抽取内容 | 优化方式 |
+| --- | --- | --- | --- |
+| 1 | `BaseTransform.matmul_1` | 从 `get_geometry_v1` 抽离逆后变换：`inverse(post_rots)` 乘 frustum 点，并执行齐次坐标的 `x*z, y*z, z` 重组 | 将矩阵乘和 `cat` 独立编译，避免与前后 host 逻辑混在同一大图 |
+| 2 | `BaseTransform.matmul_2` | 从 `get_geometry_v1` 抽离相机到 ego 的变换：合并 `rots @ inverse(intrins)`、矩阵乘点、平移 `trans` 和 `lidar2ego_trans` | 把连续 `matmul + add/sub` 放入同一编译边界，便于融合 elementwise 运算 |
+| 3 | `BaseTransform.matmul_3` | 从 `get_geometry_v1` 抽离 inverse `lidar2ego_rots` 对点的最后一次矩阵变换 | 独立编译纯矩阵计算，避免该段因外层控制流反复 graph break |
+| 4 | `BaseTransform.extract_metas` | 从 `BaseTransform.forward` 抽离 `img_metas` 的 Python 遍历，以及 `camera2ego`、内参、图像增强矩阵和 `lidar2ego` 的 numpy→tensor、stack、device/dtype 转换 | 集中管理 host-side 元数据组装，外层 `forward` 直接消费规整后的张量 |
+| 5 | `MapTRPerceptionTransformer.initialize_queries_and_bev` | 从 transformer `forward` 抽离 query split/expand、reference point 预测与 sigmoid、query/BEV 的 permute，以及静态 `spatial_shapes`/`level_start_index` 构造 | 缩小 transformer 主图的图边界，让 query 初始化可单独跟踪和编译 |
+| 6 | `MapTRv2Head.compute_decoder_predictions` | 从 head `forward` 抽离逐 decoder level 的分类、回归、`transform_box` 和 one-to-one/one-to-many 结果汇总循环 | 把逐层张量计算集中到独立编译单元；当前接入中 `seg_head`/`pv_seg_head` 留在 eager 侧，避免卷积进入该编译边界 |
+| 7 | `MapTRv2Head.prepare_transformer_inputs` | 从 head `forward` 抽离训练/推理的 `num_vec` 选择、query embedding、BEV query、位置编码和 `self_attn_mask` 构造 | 将配置分支和输入准备工作显式切出，使后续 transformer 段使用稳定的输入结构 |
+
+以通用结构表示：
+
+```python
+def large_forward(self, ...):
+    # Python 控制流、配置判断和输入组装
+    ...
+    result = self.compiled_helper(...)
+    ...
+    return result
+
+
+@torch.compile()
+def compiled_helper(self, ...):
+    # 相对独立的张量计算
+    ...
+    return result
+```
+
+这些拆分的核心收益不是增加算子，而是改变编译边界：Dynamo 不再试图编译包含 Python循环、list 拼接、numpy 转换或配置分支的整个大方法，只编译其中稳定的张量段，从而减少graph break 和无效重编译，并为 Inductor 创造更多融合机会。
+
+
 
 #### B6. `cdist` 替换为广播减法
 
@@ -217,26 +248,193 @@ A/B 开关。
 #### B7. Assigner 静态化与 Hungarian 隔离
 
 `projects/mmdet3d_plugin/maptr/assigners/maptr_assigner.py`
+
+**原始代码（基线）**：
+
+```python
+def assign(self, bbox_pred, cls_pred, pts_pred, gt_bboxes,
+           gt_labels, gt_pts, gt_bboxes_ignore=None, eps=1e-7):
+    assert gt_bboxes_ignore is None
+    assert bbox_pred.shape[-1] == 4
+    
+    ##-------------------------删除--------------------------------##
+    num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
+
+    assigned_gt_inds = bbox_pred.new_full(
+        (num_bboxes,), -1, dtype=torch.long)
+    assigned_labels = bbox_pred.new_full(
+        (num_bboxes,), -1, dtype=torch.long)
+
+    if num_gts == 0 or num_bboxes == 0:
+        if num_gts == 0:
+            assigned_gt_inds[:] = 0
+        return AssignResult(
+            num_gts, assigned_gt_inds, None,
+            labels=assigned_labels), None
+
+    cls_cost = self.cls_cost(cls_pred, gt_labels)
+    normalized_gt_bboxes = normalize_2d_bbox(gt_bboxes, self.pc_range)
+    reg_cost = self.reg_cost(
+        bbox_pred[:, :4], normalized_gt_bboxes[:, :4])
+    ##-------------------------删除--------------------------------##
+
+    _, num_orders, num_pts_per_gtline, _ = gt_pts.shape
+    normalized_gt_pts = (
+        normalize_2d_pts(gt_pts, self.pc_range)
+        if not self.z_cfg["gt_z_flag"]
+        else normalize_3d_pts(gt_pts, self.pc_range)
+    )
+    if pts_pred.size(1) != num_pts_per_gtline:
+        pts_pred_interpolated = F.interpolate(
+            pts_pred.permute(0, 2, 1),
+            size=(num_pts_per_gtline,),
+            mode="linear",
+            align_corners=True,
+        ).permute(0, 2, 1).contiguous()
+    else:
+        pts_pred_interpolated = pts_pred
+
+    pts_cost_ordered = self.pts_cost(
+        pts_pred_interpolated, normalized_gt_pts)
+    pts_cost_ordered = pts_cost_ordered.view(
+        num_bboxes, num_gts, num_orders)
+    pts_cost, order_index = torch.min(pts_cost_ordered, 2)
+
+    bboxes = denormalize_2d_bbox(bbox_pred, self.pc_range)
+    iou_cost = self.iou_cost(bboxes, gt_bboxes)
+    cost = cls_cost + reg_cost + iou_cost + pts_cost
+    ##-------------------------删除--------------------------------##
+    cost = cost.detach().cpu()
+    if linear_sum_assignment is None:
+        raise ImportError("Please run pip install scipy first.")
+    matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
+    matched_row_inds = torch.from_numpy(matched_row_inds).to(
+        bbox_pred.device)
+    matched_col_inds = torch.from_numpy(matched_col_inds).to(
+        bbox_pred.device)
+
+    assigned_gt_inds[:] = 0
+    assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
+    assigned_labels[matched_row_inds] = gt_labels[matched_col_inds]
+    
+    return AssignResult(
+        num_gts, assigned_gt_inds, None,
+        labels=assigned_labels), order_index
+    ##-------------------------删除--------------------------------##
+```
+
+**优化后代码**：
+
+```python
+##------------------------------新增-----------------------------------##
+@torch._dynamo.disable
+def hungarian_match(self, cost, gt_labels, assigned_gt_inds,
+                    assigned_labels, num_gts, device):
+    cost = cost.detach().cpu()
+    if linear_sum_assignment is None:
+        raise ImportError("Please run pip install scipy first.")
+
+    matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
+    matched_row_inds = torch.as_tensor(matched_row_inds, device=device)
+    matched_col_inds = torch.as_tensor(matched_col_inds, device=device)
+
+    assigned_gt_inds[:] = 0
+    assigned_gt_inds[matched_row_inds] = matched_col_inds + 1
+    assigned_labels[matched_row_inds] = (
+        gt_labels[0][matched_col_inds])
+
+    return AssignResult(
+        num_gts, assigned_gt_inds, None,
+        labels=assigned_labels)
+ ##------------------------------新增-----------------------------------##
+
+@torch.compile(options={
+    "triton.cudagraphs": True,
+    "triton.cudagraph_trees": False,
+})
+def assign(self, bbox_pred, cls_pred, pts_pred, gt_bboxes,
+           gt_labels, gt_pts, gt_bboxes_ignore=None, eps=1e-7):
+    assert gt_bboxes_ignore is None
+    assert bbox_pred.shape[-1] == 4
+
+    ##------------------------------新增-----------------------------------##
+    num_bboxes = bbox_pred.size(0)
+
+    assigned_gt_inds = bbox_pred.new_full(
+        (num_bboxes,), -1, dtype=torch.long)
+    assigned_labels = bbox_pred.new_full(
+        (num_bboxes,), -1, dtype=torch.long)
+
+    cls_cost = self.cls_cost(cls_pred, gt_labels[0])
+    normalized_gt_bboxes = normalize_2d_bbox(
+        gt_bboxes[0], self.pc_range)
+    ##------------------------------新增-----------------------------------##
+    _, num_orders, num_pts_per_gtline, _ = gt_pts[0].shape
+    normalized_gt_pts = (
+        normalize_2d_pts(gt_pts[0], self.pc_range)
+        if not self.z_cfg["gt_z_flag"]
+        else normalize_3d_pts(gt_pts[0], self.pc_range)
+    )
+    if pts_pred.size(1) != num_pts_per_gtline:
+        pts_pred_interpolated = F.interpolate(
+            pts_pred.permute(0, 2, 1),
+            size=(num_pts_per_gtline,),
+            mode="linear",
+            align_corners=True,
+        ).permute(0, 2, 1).contiguous()
+    else:
+        pts_pred_interpolated = pts_pred
+
+    bboxes = denormalize_2d_bbox(bbox_pred, self.pc_range)
+    pts_cost_ordered = self.pts_cost(
+        pts_pred_interpolated, normalized_gt_pts)
+    pts_cost_ordered = pts_cost_ordered.view(
+        num_bboxes, gt_bboxes[0].size(0), num_orders)
+    pts_cost, order_index = torch.min(pts_cost_ordered, 2)
+
+    reg_cost = self.reg_cost(
+        bbox_pred[:, :4], normalized_gt_bboxes[:, :4])
+    iou_cost = self.iou_cost(bboxes, gt_bboxes[0])
+    cost = cls_cost + reg_cost + iou_cost + pts_cost
+ ##------------------------------新增-----------------------------------##
+    assign_result = self.hungarian_match(
+        cost[:, gt_bboxes[1]],
+        gt_labels,
+        assigned_gt_inds,
+        assigned_labels,
+        gt_bboxes[2],
+        bbox_pred.device,
+    )
+    return assign_result, order_index
+ ##------------------------------新增-----------------------------------##
+```
+
+**关键优化差异（删减版）**：以下 `...` 表示未改动的中间代码：
+
 ```diff
 -    num_gts, num_bboxes = gt_bboxes.size(0), bbox_pred.size(0)
 -    if num_gts == 0 or num_bboxes == 0:
 -        ...
--        return AssignResult(num_gts, assigned_gt_inds, None, labels=assigned_labels), None
+-        return AssignResult(
+-            num_gts, assigned_gt_inds, None,
+-            labels=assigned_labels), None
 -    cls_cost = self.cls_cost(cls_pred, gt_labels)
 -    normalized_gt_bboxes = normalize_2d_bbox(gt_bboxes, self.pc_range)
 +    num_bboxes = bbox_pred.size(0)
-+    # if num_gts == 0 or num_bboxes == 0: ...   # 由外部保证 padding，去掉动态 early-return
++    # GT 已由外层 pad，并携带 valid_mask 和真实 num_gts
 +    cls_cost = self.cls_cost(cls_pred, gt_labels[0])
 +    normalized_gt_bboxes = normalize_2d_bbox(gt_bboxes[0], self.pc_range)
 ...
 -    matched_row_inds, matched_col_inds = linear_sum_assignment(cost)
 -    ...
--    return AssignResult(num_gts, ..., labels=assigned_labels), order_index
+-    return AssignResult(
+-        num_gts, assigned_gt_inds, None,
+-        labels=assigned_labels), order_index
 +    assign_result = self.hungarian_match(
-+        cost[:, gt_bboxes[1]], gt_labels, assigned_gt_inds, assigned_labels,
-+        gt_bboxes[2], bbox_pred.device)
++        cost[:, gt_bboxes[1]], gt_labels, assigned_gt_inds,
++        assigned_labels, gt_bboxes[2], bbox_pred.device)
 +    return assign_result, order_index
-
++
 +    @torch._dynamo.disable
 +    def hungarian_match(self, cost, gt_labels, assigned_gt_inds, assigned_labels, num_gts, device):
 +        cost = cost.detach().cpu()
@@ -252,9 +450,26 @@ A/B 开关。
 **关键调用约定变化**：`gt_bboxes` 从张量改为 `(padded_bboxes, valid_mask, num_gts)` 元组；`gt_labels`/`gt_pts` 也取 `[0]` 索引。相当于外层把每 batch 的 GT 预先 pad 到固定形状 + mask，让匹配路径的张量形状不再依赖当前 batch 的 GT 数量。
 
 **优点**：
+
 - 消除 `num_gts == 0 or num_bboxes == 0` 这类动态分支 + 早退，让 dynamo 能追踪。
 - 将 CPU-only 的 SciPy `linear_sum_assignment` 单独打上 `@torch._dynamo.disable`，避免拖垮整图。
 - GT 形状固定 → `torch.compile` guard 不会因每步 batch 内 GT 数量抖动而失效。
+
+**实现修正（2026-09-23）**：启用 `maptrv2.assigner` 后曾在反向阶段触发 Inductor stride 断言，例如：
+
+```text
+AssertionError: expected size 256==256, stride 375==1 at dim=1
+```
+
+原因是 assignment/matching 本身不可导，但此前整个 `assign()` 默认进入`torch.compile(..., cudagraphs=True)`，在 channels-last 模型上与反向图/布局发生冲突。当前实现将其修正为：
+
+- `assign()` 的匹配计算统一放入 `torch.no_grad()`，避免建立无意义的 backward 图；
+- `torch.compile` 改为显式 opt-in，默认读取
+  `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE=0`，不再默认编译 Assigner；
+- `configs/runtime.yaml` 同样显式写入 `0`，作为运行时双重保险；
+- 现有 GT padding、valid mask、`_get_target_single()` 和 Hungarian 隔离逻辑不变。
+
+服务器验证：仅上传 `assigner.py` 修改后，训练已可正常启动，说明问题由 Assigner默认编译路径引起，修复不依赖模型源码或其他优化 Group。已增加默认 eager 路径回归测试。
 
 #### B8. EfficientNet 注册覆盖
 
@@ -374,6 +589,7 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 
 ```diff
 -from mmcv import _ext as ext_module
+
 +try:
 +    from lightop import op as ext_module   # Hygon DCU 优化的 MS-Deformable-Attn 算子
 +except ImportError:
@@ -385,6 +601,91 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 **优点**：`lightop` 是 Hygon 针对 DCU 优化的 MS-Deformable-Attention CUDA 扩展，性能优于 mmcv 通用实现；`try/except` 保证在 lightop 未安装时自动 fallback 到 mmcv，不影响可移植性。
 
 **归属**：这是运行时 import 级别的替换，写在模型源码中。TurboPhysAI 的通用 `mmcv.msda` Group patch 的是 mmcv 层的符号，与 lightop 是不同路径；若 lightop 已安装则 mmcv.msda 不会在关键路径生效。**当前未通过 TurboPhysAI recipe 管理**，属于需要随模型源码部署 lightop 库的硬件适配项。
+
+#### B14. MIOpen / rocBLAS 运行时调优
+
+> 背景知识
+
+```python
+# NVIDIA CUDA 生态
+PyTorch
+  ↓
+CUDA 软件栈
+  ├── CUDA Driver/Runtime → 设备、显存、流和 kernel 调度
+  ├── nvcc/NVRTC          → CUDA 编译与运行时编译
+  ├── cuDNN               → Conv2d、池化、归一化等
+  ├── cuBLAS/cuBLASLt     → GEMM、Linear、matmul、bmm 等
+  ├── NCCL                → 多卡、多机集合通信
+  ├── TensorRT            → 推理图优化和部署
+  ├── cuSPARSE            → 稀疏矩阵运算
+  ├── cuFFT               → FFT
+  ├── cuSOLVER            → 稠密与稀疏线性方程求解、特征值分解
+  └── Nsight              → 性能分析与调试
+
+# AMD ROCm 生态
+PyTorch
+  ↓
+ROCm 软件栈
+  ├── ROCm Runtime / HIP → 设备、显存、流和 kernel 调度
+  ├── hipcc             → HIP/C++ 编译
+  ├── MIOpen            → Conv2d、池化、归一化等
+  ├── rocBLAS           → GEMM、Linear、matmul、bmm 等 BLAS 实现
+  ├── hipBLAS           → BLAS 封送库(支持 rocBLAS / cuBLAS 后端)
+  ├── hipBLASLt         → 高性能 GEMM 算法和布局优化
+  ├── RCCL              → 多卡、多机集合通信
+  ├── MIGraphX          → 推理图优化和部署
+  ├── rocSPARSE         → 稀疏矩阵运算
+  ├── rocFFT            → FFT
+  ├── rocSOLVER         → 线性方程求解
+  └── rocprof           → 性能分析
+    
+# Hygon DCU 兼容生态
+PyTorch
+  ↓
+Hygon DCU 软件栈
+  ├── DCU Driver + hyhal       → 硬件抽象、设备管理和资源访问
+  ├── DTK/HIP Runtime          → 显存、流、kernel 调度和 HIP 接口
+  ├── DTK/HIP 编译工具链         → HCU 平台上的 HIP / C++ 编译
+  ├── MIOpen / hipDNN          → Conv2d、池化、归一化等
+  ├── rocBLAS                  → GEMM、Linear、matmul、bmm 等 BLAS 实现
+  ├── hipBLASLt              → 高性能 GEMM 算法和布局优化
+  ├── RCCL                     → 多卡、多机集合通信
+  ├── hy-smi                   → 设备状态和 NUMA 拓扑查询
+  ├── LightOp                  → HCU 原生高性能算子
+  └── TurboPhysAI              → 算子替换、图优化和训练性能优化
+```
+
+ROCm 是 AMD 推出的开源 GPU/HPC 计算平台，可类比 NVIDIA CUDA，为 PyTorch 等框架在 AMD GPU 及兼容硬件（如 Hygon DCU）上执行训练和推理提供完整软件栈。**包括：**运行时与驱动接口、HIP 编程模型、编译器及算子生成工具，以及高性能算子库（MIOpen 负责卷积等深度学习算子，rocBLAS 提供 GEMM 等基础线性代数算子，hipBLASLt 提供面向 GEMM 的高性能扩展）：
+
+- **MIOpen** 是 ROCm 平台上的深度学习算子库，作用类似于 CUDA 平台的 cuDNN。PyTorch 在 ROCm/HCU 上执行 `Conv2d` 等卷积算子时，通常由 MIOpen 提供具体 kernel，**MIOpen 卷积**即模型中的卷积层最终由 MIOpen 实现和调度。
+- **rocBLAS** 是 ROCm 平台上的 BLAS 库，作用类似于 CUDA 平台的 cuBLAS，主要**提供 GEMM 等稠密线性代数算子**。PyTorch 的 `Linear`、`matmul`、`bmm` 及 attention 中的投影矩阵运算，在 ROCm 上可能由 rocBLAS 或 hipBLASLt 执行，具体取决于 PyTorch/ROCm 版本和输入条件。
+- **hipBLASLt** 是面向 ROCm/HCU 的**高性能 GEMM 扩展库**，提供算法选择、矩阵布局和 fused epilogue 等能力，可视为 rocBLAS 在部分矩阵乘场景下的专用后端。PyTorch 会按版本、shape、dtype 和布局条件决定是否使用 hipBLASLt；`ROCBLAS_MATH_MODE` 不保证覆盖 hipBLASLt 路径。
+
+>  优化侧启动脚本 `start_mmdet3d.sh` 设置了以下环境变量：
+
+```
+export PYTORCH_MIOPEN_SUGGEST_NHWC=1
+export MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32=1
+export MIOPEN_FIND_MODE=1
+export ROCBLAS_MATH_MODE=1
+```
+
+| 环境变量 | 作用 | 配合模型代码 | 适用范围 |
+| --- | --- | --- | --- |
+| `PYTORCH_MIOPEN_SUGGEST_NHWC=1` | 允许 MIOpen 为卷积选择 NHWC 实现 | 需配合 channels-last | **MIOpen 卷积：**要求输入 channels-last，不限定 FP32 |
+| `MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32=1` | 允许 MIOpen 的 FP32 卷积使用 TF32 型计算配置 | 不需要 | **MIOpen 的 FP32 卷积：**不优化 FP16/BF16 卷积，不优化 rocBLAS GEMM |
+| `MIOPEN_FIND_MODE=1` | 为固定卷积 shape 搜索并缓存更快的算法 | 不需要 | **MIOpen 卷积：**算法搜索，不限精度 |
+| `ROCBLAS_MATH_MODE=1` | 允许 rocBLAS 为 FP32 GEMM 选择快速数学内核 | 不需要 | **FP32 GEMM/matmul：**不优化 MIOpen 卷积 |
+
+四个变量都是库级运行时配置，只有训练实际经过对应算子时才可能生效如果只设置变量但没有相应 Conv/GEMM 或 channels-last 输入，不会自动获得收益。变量是进程级环境变量，不是可原子替换的 Python 符号，应在 `python`/`torchrun` 启动前注入。TurboPhysAI 已将其映射到本包 `configs/runtime.yaml` 的 `environment.set`，通过 `turbo-physai run --runtime-config ...` 注入。
+
+**适用与限制**：
+
+- `PYTORCH_MIOPEN_SUGGEST_NHWC` 和 `MIOPEN_FIND_MODE` 作用于 MIOpen 卷积，不限定具体精度；`MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32` 只作用于 FP32 Conv；`ROCBLAS_MATH_MODE` 只作用于对应 FP32 GEMM/matmul。
+- MapTRv2 配置启用了 `fp16`，因此图像 backbone 的 Conv 通常走 FP16，不应把这项优化描述为覆盖整个 backbone；强制 FP32 的 LSSTransform、几何和部分 head 计算才是主要验证范围。
+- 仅设置变量不保证加速，实际效果取决于 MIOpen/rocBLAS 版本、输入 layout、shape 稳定性和硬件拓扑。
+- `MIOPEN_FIND_MODE` 首次运行会增加算法搜索时间，应保留算法缓存并区分预热与稳态性能。
+- TF32/快速数学模式可能改变数值结果，应比较 loss、梯度、mAP/chamfer 和不确定性。
 
 ---
 
@@ -894,19 +1195,10 @@ turbo-physai run \
   python tools/train.py <原训练参数>
 ```
 
-`generate` 会校验仓库状态、commit 和每个 `target`，所以基线符号不存在时会在此处直接报错。
-训练跑通后，再逐个打开默认关闭的 `maptrv2.compile`、`maptrv2.assigner`，分别与基线对齐
-loss 曲线和 nuScenes mAP，并记录性能数据。
+`generate` 会校验仓库状态、commit 和每个 `target`，所以基线符号不存在时会在此处直接报错。训练跑通后，再逐个打开默认关闭的 `maptrv2.compile`、`maptrv2.assigner`，分别与基线对齐loss 曲线和 nuScenes mAP，并记录性能数据。
 
-**当前状态**：删除非权威扩展前，`maptrv2_optimization/` 下 12 个 `.py` 已通过
-`python -m py_compile`；Python 3.11 + CPU torch 2.14 + numpy/shapely/opencv/pillow 环境下，
-上述两个测试文件得到 **30 passed、53 subtests passed、0 skipped**。测试用最小 `mmcv` 桩替代
-`runner.auto_fp16`，GridMask 的装饰器组合及 HCU 路径尚未实测。删除相关代码后需要重新执行
-定向测试。所有 `target` 已在基线 worktree `e03f097` 定位到定义行，Group ID、recipe 和环境
-变量保持一致。
-
-`generate/check/run`、训练级精度/性能 A/B 仍需上机完成。核对期间还修正了两处测试缺陷：
-`project_points` 的期望值补上官方 `perspective()` 的 `+ 1e-7`；`MatchCost` 由 float32
+**当前状态**：删除非权威扩展前，`maptrv2_optimization/` 下 12 个 `.py` 已通过`python -m py_compile`；Python 3.11 + CPU torch 2.14 + numpy/shapely/opencv/pillow 环境下，上述两个测试文件得到 **30 passed、53 subtests passed、0 skipped**。测试用最小 `mmcv` 桩替代
+`runner.auto_fp16`，GridMask 的装饰器组合及 HCU 路径尚未实测。删除相关代码后需要重新执行定向测试。所有 `target` 已在基线 worktree `e03f097` 定位到定义行，Group ID、recipe 和环境变量保持一致。`generate/check/run`、训练级精度/性能 A/B 仍需上机完成。核对期间还修正了两处测试缺陷：`project_points` 的期望值补上官方 `perspective()` 的 `+ 1e-7`；`MatchCost` 由 float32
 逐位比较改为 float64 严格比较 + float32 `1e-5` 容差。
 
 ### 3.5 文档同步
@@ -916,8 +1208,7 @@ loss 曲线和 nuScenes mAP，并记录性能数据。
 | `maptrv2_optimization/README.md` | Group ID、作用、启停建议、验证记录 | 已完成 |
 | `model_examples/MapTRv2/README.md` / 支持清单 | 模型版本、验证 commit、启用 Group、性能对比 | 待上机 A/B 后补充 |
 
-文档中禁止出现内部路径、凭据、令牌或未脱敏日志。支持清单必须基于已跑通的训练命令和 A/B
-数据，避免文档领先于事实。
+文档中禁止出现内部路径、凭据、令牌或未脱敏日志。支持清单必须基于已跑通的训练命令和 A/B数据，避免文档领先于事实。
 
 ### 3.6 参考实现覆盖审计
 
@@ -957,7 +1248,7 @@ loss 曲线和 nuScenes mAP，并记录性能数据。
 | 多个 point ops 去掉 `THC/THC.h`、改用 `ATen/cuda/CUDAContext.h` | **未接入 PhysAI**；属于 mmdet3d/CUDA 扩展的 PyTorch 版本兼容修补 |
 | `__CUDA_ARCH__` → `__CUDACC__`、C++14 → C++17 | **未接入 PhysAI**；属于扩展构建兼容 |
 | mmcv 上限 1.4.0 → 1.6.2、numba import、requirements 版本解绑 | **未接入 PhysAI**；属于镜像/依赖环境适配，不应做成 recipe Group |
-| `start_mmdet3d.sh` 的 MIOpen、rocBLAS、NCCL、Inductor、HSA 环境变量 | **已按参考启动脚本写入 MapTRv2 runtime**：这些是参考环境的调优默认值，不代表每项都是运行必需；RCCL 拓扑项需按实际部署覆盖 |
+| `start_mmdet3d.sh` 的 MIOpen、rocBLAS、NCCL、Inductor、HSA 环境变量 | **已按参考启动脚本写入 MapTRv2 runtime**：MIOpen/rocBLAS 部分见 B14；这些是参考环境的调优默认值，不代表每项都是运行必需，RCCL 拓扑项需按实际部署覆盖 |
 | Dockerfile、空 `build.sh`、数据下载脚本 | **不纳入模型优化包**；属于镜像和部署资产 |
 | 根目录新增 `test.py` | **不纳入模型优化包**；内容是临时 CUDA tensor 构造试验 |
 
@@ -1024,6 +1315,8 @@ def hot_method(...):
 
 **U2. 7 个新增 Helper 挂点（未接入）**
 
+7 项的具体抽取内容和编译收益见 §B5.1；此处保留未接入原因及后续处理边界。
+
 参考实现把大函数中的局部逻辑抽成小函数，再单独编译：
 
 ```python
@@ -1076,9 +1369,7 @@ if x.dim() == 5 and x.shape[-1] == self.C:
 final = torch.cat(x.unbind(dim=2), 1)
 ```
 
-`catalog.py` 注册 `maptrv2.bev_pool_fix` group，通过 `replace` 在模型实例化前把
-`BaseTransform.bev_pool` 换成修正版；`recipe.yaml` 和 `configs/optimization.yaml` 均设为
-`enabled: true`。`encoder.py` 全程未改动。
+`catalog.py` 注册 `maptrv2.bev_pool_fix` group，通过 `replace` 在模型实例化前把`BaseTransform.bev_pool` 换成修正版；`recipe.yaml` 和 `configs/optimization.yaml` 均设为`enabled: true`。`encoder.py` 全程未改动。
 
 条件 `x.shape[-1] == self.C` 保证 CUDA 路径（`shape[-1] != self.C`）不会误触发，向前兼容。
 

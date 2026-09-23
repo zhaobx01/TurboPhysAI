@@ -39,6 +39,14 @@ def dynamo_available(*_args, **_kwargs) -> bool:
     return callable(getattr(dynamo, "disable", None))
 
 
+def static_assigner_available(*_args, **_kwargs) -> bool:
+    """Return whether the complete static assigner path can run."""
+
+    if os.getenv("TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC", "0") == "1":
+        return False
+    return torch_compile_available() and dynamo_available()
+
+
 def pv_mask_sampling_enabled(*_args, **_kwargs) -> bool:
     """Return ``True`` when the vectorized PV-mask resampling may be used."""
 
@@ -48,5 +56,6 @@ def pv_mask_sampling_enabled(*_args, **_kwargs) -> bool:
 __all__ = [
     "dynamo_available",
     "pv_mask_sampling_enabled",
+    "static_assigner_available",
     "torch_compile_available",
 ]

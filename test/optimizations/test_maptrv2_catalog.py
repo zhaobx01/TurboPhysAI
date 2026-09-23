@@ -24,9 +24,11 @@ EXPECTED_GROUPS = {
     "maptrv2.compile": Mechanism.WRAPPER,
     "maptrv2.match_cost": Mechanism.REPLACE,
     "maptrv2.pv_mask": Mechanism.REPLACE,
-    "maptrv2.assigner": Mechanism.WRAPPER,
+    "maptrv2.assigner": Mechanism.REPLACE,
     "maptrv2.efficientnet": Mechanism.REGISTRY_OVERRIDE,
+    "maptrv2.spconv_registry": Mechanism.REGISTRY_OVERRIDE,
     "maptrv2.bev_pool_fix": Mechanism.REPLACE,
+    "maptrv2.reference_boundaries": Mechanism.WRAPPER,
 }
 
 # Groups whose members must re-check an optional dependency on every call.
@@ -34,9 +36,12 @@ EXPECTED_GROUPS = {
 EXPECTED_CONDITIONS = {
     "maptrv2.compile": (
         "turbo_physai.optimizations.models.maptrv2_optimization.compat.torch_compile_available", 10),
-    "maptrv2.assigner": ("turbo_physai.optimizations.models.maptrv2_optimization.compat.dynamo_available", 1),
+    "maptrv2.assigner": (
+        "turbo_physai.optimizations.models.maptrv2_optimization.compat.static_assigner_available", 3),
     "maptrv2.pv_mask": (
-        "turbo_physai.optimizations.models.maptrv2_optimization.compat.pv_mask_sampling_enabled", 2),
+        "turbo_physai.optimizations.models.maptrv2_optimization.compat.pv_mask_sampling_enabled", 3),
+    "maptrv2.reference_boundaries": (
+        "turbo_physai.optimizations.models.maptrv2_optimization.compat.torch_compile_available", 5),
 }
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -52,7 +57,7 @@ class CatalogTest(unittest.TestCase):
             [
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA", "EFFICIENTNET",
                 "GRID_MASK", "MATCH_COST", "PV_MASK",
-                "TRAINING",
+                "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "TRAINING",
             ],
         )
         for group_id in EXPECTED_GROUPS:
@@ -101,6 +106,11 @@ class CatalogTest(unittest.TestCase):
             targets,
         )
         self.assertIn(
+            "projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset."
+            "VectorizedLocalMap.gen_vectorized_samples",
+            targets,
+        )
+        self.assertIn(
             "projects.mmdet3d_plugin.maptr.modules.encoder."
             "LSSTransform.get_cam_feats",
             targets,
@@ -117,6 +127,41 @@ class CatalogTest(unittest.TestCase):
         )
         self.assertIn(
             "projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head.loss",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head._get_target_single",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "BaseTransform.get_geometry_v1",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "BaseTransform.forward",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "LSSTransform.forward",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.modules.transformer."
+            "MapTRPerceptionTransformer.forward",
+            targets,
+        )
+        self.assertIn(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head.forward",
             targets,
         )
 
@@ -176,6 +221,25 @@ class CatalogTest(unittest.TestCase):
                 spec = default_registry.get_spec(replacement_id)
                 with self.subTest(group_id=group_id):
                     self.assertEqual(spec.mechanism, mechanism)
+
+    def test_sparse_conv_registry_covers_all_reference_classes(self):
+        group = default_registry.get_group("maptrv2.spconv_registry")
+        spec = default_registry.get_spec(group.members[0])
+        self.assertEqual(
+            spec.mechanism_options["names"],
+            (
+                "SparseConv2d",
+                "SparseConv3d",
+                "SparseConv4d",
+                "SparseConvTranspose2d",
+                "SparseConvTranspose3d",
+                "SparseInverseConv2d",
+                "SparseInverseConv3d",
+                "SubMConv2d",
+                "SubMConv3d",
+                "SubMConv4d",
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -151,8 +151,168 @@ def line_ego_to_mask(self,
                   thickness=thickness)
 
 
+def gen_vectorized_samples(
+    self, map_annotation, example=None, feat_down_sample=32
+):
+    """Reference vectorization path without the redundant vertex copy."""
+
+    from projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset import (
+        LiDARInstanceLines,
+    )
+    from shapely.geometry import LineString
+
+    vectors = []
+    for vec_class in self.vec_classes:
+        for instance in map_annotation[vec_class]:
+            vectors.append(
+                (
+                    LineString(instance),
+                    self.CLASS2LABEL.get(vec_class, -1),
+                )
+            )
+
+    gt_labels = []
+    gt_instance = []
+    if self.aux_seg["use_aux_seg"]:
+        if self.aux_seg["seg_classes"] == 1:
+            if self.aux_seg["bev_seg"]:
+                gt_semantic_mask = np.zeros(
+                    (1, self.canvas_size[0], self.canvas_size[1]),
+                    dtype=np.uint8,
+                )
+            else:
+                gt_semantic_mask = None
+            if self.aux_seg["pv_seg"]:
+                num_cam = len(example["img_metas"].data["pad_shape"])
+                img_shape = example["img_metas"].data["pad_shape"][0]
+                gt_pv_semantic_mask = np.zeros(
+                    (
+                        num_cam,
+                        1,
+                        img_shape[0] // feat_down_sample,
+                        img_shape[1] // feat_down_sample,
+                    ),
+                    dtype=np.uint8,
+                )
+                lidar2img = example["img_metas"].data["lidar2img"]
+                scale_factor = np.eye(4)
+                scale_factor[0, 0] *= 1 / 32
+                scale_factor[1, 1] *= 1 / 32
+                lidar2feat = [
+                    scale_factor @ transform for transform in lidar2img
+                ]
+            else:
+                gt_pv_semantic_mask = None
+            for instance, instance_type in vectors:
+                if instance_type == -1:
+                    continue
+                gt_instance.append(instance)
+                gt_labels.append(instance_type)
+                if instance.geom_type != "LineString":
+                    print(instance.geom_type)
+                    continue
+                if self.aux_seg["bev_seg"]:
+                    self.line_ego_to_mask(
+                        instance,
+                        gt_semantic_mask[0],
+                        color=1,
+                        thickness=self.thickness,
+                    )
+                if self.aux_seg["pv_seg"]:
+                    for cam_index in range(num_cam):
+                        self.line_ego_to_pvmask(
+                            instance,
+                            gt_pv_semantic_mask[cam_index][0],
+                            lidar2feat[cam_index],
+                            color=1,
+                            thickness=self.aux_seg["pv_thickness"],
+                        )
+        else:
+            if self.aux_seg["bev_seg"]:
+                gt_semantic_mask = np.zeros(
+                    (
+                        len(self.vec_classes),
+                        self.canvas_size[0],
+                        self.canvas_size[1],
+                    ),
+                    dtype=np.uint8,
+                )
+            else:
+                gt_semantic_mask = None
+            if self.aux_seg["pv_seg"]:
+                num_cam = len(example["img_metas"].data["pad_shape"])
+                img_shape = example["img_metas"].data["pad_shape"][0]
+                gt_pv_semantic_mask = np.zeros(
+                    (
+                        num_cam,
+                        len(self.vec_classes),
+                        img_shape[0] // feat_down_sample,
+                        img_shape[1] // feat_down_sample,
+                    ),
+                    dtype=np.uint8,
+                )
+                lidar2img = example["img_metas"].data["lidar2img"]
+                scale_factor = np.eye(4)
+                scale_factor[0, 0] *= 1 / 32
+                scale_factor[1, 1] *= 1 / 32
+                lidar2feat = [
+                    scale_factor @ transform for transform in lidar2img
+                ]
+            else:
+                gt_pv_semantic_mask = None
+            for instance, instance_type in vectors:
+                if instance_type == -1:
+                    continue
+                gt_instance.append(instance)
+                gt_labels.append(instance_type)
+                if instance.geom_type != "LineString":
+                    print(instance.geom_type)
+                    continue
+                if self.aux_seg["bev_seg"]:
+                    self.line_ego_to_mask(
+                        instance,
+                        gt_semantic_mask[instance_type],
+                        color=1,
+                        thickness=self.thickness,
+                    )
+                if self.aux_seg["pv_seg"]:
+                    for cam_index in range(num_cam):
+                        self.line_ego_to_pvmask(
+                            instance,
+                            gt_pv_semantic_mask[cam_index][instance_type],
+                            lidar2feat[cam_index],
+                            color=1,
+                            thickness=self.aux_seg["pv_thickness"],
+                        )
+    else:
+        for instance, instance_type in vectors:
+            if instance_type != -1:
+                gt_instance.append(instance)
+                gt_labels.append(instance_type)
+        gt_semantic_mask = None
+        gt_pv_semantic_mask = None
+
+    gt_instance = LiDARInstanceLines(
+        gt_instance,
+        gt_labels,
+        self.sample_dist,
+        self.num_samples,
+        self.padding,
+        self.fixed_num,
+        self.padding_value,
+        patch_size=self.patch_size,
+    )
+    return {
+        "gt_vecs_pts_loc": gt_instance,
+        "gt_vecs_label": gt_labels,
+        "gt_semantic_mask": gt_semantic_mask,
+        "gt_pv_semantic_mask": gt_pv_semantic_mask,
+    }
+
+
 __all__ = [
     "PV_MASK_SAMPLES",
+    "gen_vectorized_samples",
     "line_ego_to_mask",
     "line_ego_to_pvmask",
     "project_points",

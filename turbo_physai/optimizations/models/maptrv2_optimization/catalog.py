@@ -23,11 +23,17 @@ Group                                        Reference change
 ``maptrv2.pv_mask``                          ``line_ego_to_pvmask`` drops the
                                              shapely interpolation loop and
                                              ``line_ego_to_mask`` merges the
-                                             two affine transform steps
-``maptrv2.assigner``                         SciPy Hungarian matching isolated
-                                             from Dynamo
+                                             two affine transform steps;
+                                             ``gen_vectorized_samples`` drops one
+                                             vertex copy
+``maptrv2.assigner``                         padded GT contract and Dynamo
+                                             isolation for Hungarian matching
 ``maptrv2.efficientnet``                     ``EfficientNet`` allowed to
                                              override the registry entry
+``maptrv2.spconv_registry``                  SparseConv classes allowed to
+                                             override registry entries
+``maptrv2.reference_boundaries``             eight extracted helper boundaries
+                                             plus the reference BEV layout
 ===========================================  ==================================
 
 ``maptrv2.training`` also pins the fp32 matmul precision to the reference's
@@ -56,7 +62,10 @@ _ASSIGN_API = (
 # consent, so the Groups that depend on them dispatch per call instead of
 # failing while ``apply`` installs them.  See ``turbo_physai.optimizations.models.maptrv2_optimization.compat``.
 _COMPILE_CONDITION = "turbo_physai.optimizations.models.maptrv2_optimization.compat.torch_compile_available"
-_DYNAMO_CONDITION = "turbo_physai.optimizations.models.maptrv2_optimization.compat.dynamo_available"
+_STATIC_ASSIGNER_CONDITION = (
+    "turbo_physai.optimizations.models.maptrv2_optimization.compat."
+    "static_assigner_available"
+)
 _PV_MASK_CONDITION = "turbo_physai.optimizations.models.maptrv2_optimization.compat.pv_mask_sampling_enabled"
 
 
@@ -90,21 +99,9 @@ GRID_MASK = group(
     ),
 )
 
-# The validated reference implementation carries nineteen active
-# ``@torch.compile()`` hooks.  Ten of them sit on symbols that also exist in the
-# official baseline and are listed below.  Eight more sit on helpers the
-# reference extracted out of larger methods (``initialize_queries_and_bev``,
-# ``BaseTransform.matmul_1/2/3``, ``extract_metas``, ``LSSTransform.down_sample``,
-# ``compute_decoder_predictions``, ``prepare_transformer_inputs``); those symbols
-# do not exist in the baseline, where the same work is inline in
-# ``MapTRPerceptionTransformer.forward``, ``BaseTransform.get_geometry``/
-# ``forward``/``bev_pool``, ``LSSTransform.forward`` and ``MapTRv2Head.forward``.
-# Those callers are large and control-flow heavy, so they are deliberately left
-# eager.  The nineteenth hook is ``MapTRAssigner.assign``, which is handled by
-# the ``maptrv2.assigner`` Group instead.  The compiled region of this Group is
-# therefore narrower than the reference: the reference ``down_sample`` hook has
-# no baseline counterpart, its work being split between ``BaseTransform.bev_pool``
-# and ``LSSTransform.forward``, and neither is covered below.
+# The reference carries ten compile hooks on baseline symbols listed below.
+# Its eight additional helper hooks are implemented by the
+# ``maptrv2.reference_boundaries`` Group, which replaces the existing callers.
 _COMPILE_TARGETS = (
     "projects.mmdet3d_plugin.maptr.modules.transformer."
     "MapTRPerceptionTransformer.format_feats",
@@ -162,14 +159,50 @@ PV_MASK = group(
         replacement="turbo_physai.optimizations.models.maptrv2_optimization.pv_mask.line_ego_to_mask",
         runtime_condition=_PV_MASK_CONDITION,
     ),
+    replace(
+        target=(
+            "projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset."
+            "VectorizedLocalMap.gen_vectorized_samples"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "pv_mask.gen_vectorized_samples"
+        ),
+        runtime_condition=_PV_MASK_CONDITION,
+    ),
 )
 
 ASSIGNER = group(
     "maptrv2.assigner",
-    wrap(
+    replace(
         target=_ASSIGN_API,
-        replacement="turbo_physai.optimizations.models.maptrv2_optimization.compile.dynamo_disable_wrapper",
-        runtime_condition=_DYNAMO_CONDITION,
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "assigner.assign"
+        ),
+        runtime_condition=_STATIC_ASSIGNER_CONDITION,
+    ),
+    replace(
+        target=(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head.loss"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "assigner.static_loss"
+        ),
+        runtime_condition=_STATIC_ASSIGNER_CONDITION,
+    ),
+    replace(
+        target=(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head._get_target_single"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "assigner.get_target_single"
+        ),
+        runtime_condition=_STATIC_ASSIGNER_CONDITION,
     ),
 )
 
@@ -195,6 +228,85 @@ BEV_POOL_FIX = group(
     ),
 )
 
+REFERENCE_BOUNDARIES = group(
+    "maptrv2.reference_boundaries",
+    wrap(
+        target=(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "BaseTransform.get_geometry_v1"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "reference.base_transform_get_geometry_wrapper"
+        ),
+        runtime_condition=_COMPILE_CONDITION,
+    ),
+    wrap(
+        target=(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "BaseTransform.forward"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "reference.base_transform_forward_wrapper"
+        ),
+        runtime_condition=_COMPILE_CONDITION,
+    ),
+    wrap(
+        target=(
+            "projects.mmdet3d_plugin.maptr.modules.encoder."
+            "LSSTransform.forward"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "reference.ls_transform_forward_wrapper"
+        ),
+        runtime_condition=_COMPILE_CONDITION,
+    ),
+    wrap(
+        target=(
+            "projects.mmdet3d_plugin.maptr.modules.transformer."
+            "MapTRPerceptionTransformer.forward"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "reference.transformer_forward_wrapper"
+        ),
+        runtime_condition=_COMPILE_CONDITION,
+    ),
+    wrap(
+        target=(
+            "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+            "MapTRv2Head.forward"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "reference.head_forward_wrapper"
+        ),
+        runtime_condition=_COMPILE_CONDITION,
+    ),
+)
+
+SPARSE_CONV_REGISTRY = group(
+    "maptrv2.spconv_registry",
+    registry_override(
+        module="mmdet3d.ops.spconv.conv",
+        registry="mmcv.cnn.CONV_LAYERS",
+        names=(
+            "SparseConv2d",
+            "SparseConv3d",
+            "SparseConv4d",
+            "SparseConvTranspose2d",
+            "SparseConvTranspose3d",
+            "SparseInverseConv2d",
+            "SparseInverseConv3d",
+            "SubMConv2d",
+            "SubMConv3d",
+            "SubMConv4d",
+        ),
+    ),
+)
+
 __all__ = [
     "ASSIGNER",
     "BEV_POOL_FIX",
@@ -204,5 +316,7 @@ __all__ = [
     "GRID_MASK",
     "MATCH_COST",
     "PV_MASK",
+    "REFERENCE_BOUNDARIES",
+    "SPARSE_CONV_REGISTRY",
     "TRAINING",
 ]

@@ -39,13 +39,19 @@ optimization_groups:
   # EfficientNet may override an already registered backbone entry.
   - id: maptrv2.efficientnet
     enabled: true
+  # The vendored mmdet3d SparseConv classes may be pre-registered by an image.
+  - id: maptrv2.spconv_registry
+    enabled: true
   # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
   - id: maptrv2.bev_pool_fix
     enabled: true
   # torch.compile on the extracted pure-tensor hot methods. Enable after the
   # accuracy/throughput A/B on the target machine.
   - id: maptrv2.compile
-    enabled: false
-  # Keep the SciPy Hungarian solver out of Dynamo graphs.
+    enabled: true
+  # Complete static assignment contract plus Dynamo-isolated Hungarian solver.
   - id: maptrv2.assigner
-    enabled: false
+    enabled: true
+  # Eight reference helper boundaries and the reference 5D BEV layout.
+  - id: maptrv2.reference_boundaries
+    enabled: true
