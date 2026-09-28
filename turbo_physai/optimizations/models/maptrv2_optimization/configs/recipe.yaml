@@ -15,8 +15,9 @@ model:
 optimization_modules:
   - turbo_physai.optimizations.models.maptrv2_optimization.catalog
 
-extends:
-  - common.hcu.base
+# extends:
+#   # 继承自 common.hcu.base 配置，包含了基础的优化配置和通用设置
+#   - common.hcu.base
 
 compatibility: {}
 
@@ -54,4 +55,9 @@ optimization_groups:
     enabled: true
   # Eight reference helper boundaries and the reference 5D BEV layout.
   - id: maptrv2.reference_boundaries
+    enabled: true
+  # static_graph=True + find_unused_parameters=False on the DDP constructor.
+  # Keep this paired with maptrv2.assigner: the static graph assumes a fixed
+  # autograd graph, which pad_to_static_list provides.
+  - id: maptrv2.ddp_static_graph
     enabled: true

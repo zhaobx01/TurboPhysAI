@@ -1,7 +1,7 @@
 ﻿# MapTRv2 优化项分析与 TurboPhysAI 接入方案
 
 > 基线：`<workspace>/MapTR_v2`（官方 `hustvl/MapTR` 的 `maptrv2` 分支，HEAD `e03f097`）
-> 优化侧（权威）：`<workspace>/autonomous-driving-models/hygon-hub/models/MapTRv2`；本文以该版本为准。
+> 优化侧（权威）：`/workspace/MapTRv2`；未优化基线：`/workspace/model/MapTrv2`；本文以这两份本地 checkout 为准，三方差分见 §3.8。
 > 骨架：`<workspace>/TurboPhysAI/turbo_physai/optimizations/models/maptrv2_optimization`。
 
 对比方法：`git diff --no-index` 两侧全量文件并忽略行尾空白。主体统计暂时排除
@@ -143,8 +143,11 @@ class TransposeImage:
 
 #### B5. `torch.compile` 计算边界拆分
 
-优化后把内联热点抽成独立方法，并在每个方法上挂 `@torch.compile()`。权威优化版中这 19 处挂点**全部处于启用状态**。参考实现使用无参
-`@torch.compile()`；TurboPhysAI 的 recipe 实现默认使用`mode="max-autotune-no-cudagraphs"`，两者模式并不完全相同。下面只示意挂点位置：`projects/mmdet3d_plugin/maptr/modules/transformer.py`
+优化后把内联热点抽成独立方法，并在每个方法上挂 `@torch.compile`。权威优化版中这 19 处挂点
+**全部处于启用状态**，其中 18 处显式写成 `@torch.compile(mode="max-autotune-no-cudagraphs")`
+（只有 `MapTRAssigner.assign` 用 `options={"triton.cudagraphs": True, ...}`）。
+TurboPhysAI 的 recipe 默认 mode 同样是 `max-autotune-no-cudagraphs`，两者一致。
+下面只示意挂点位置：`projects/mmdet3d_plugin/maptr/modules/transformer.py`
 
 ```diff
 +    @torch.compile()
@@ -196,43 +199,164 @@ def down_sample(self, x): ...
 
 **优点**：`torch.compile` 对"纯张量、无副作用"的小函数图捕获成功率最高；把 host-side组装（`torch.tensor(...)`、`.permute`）与算子调用分离后，热点段可以单独编译，也便于A/B 开关。
 
-#### B5.1 七个新增 Helper 编译点
+#### B6. 参考实现新增 Helper 编译点的等价接入
 
-U2 的 7 项均采用同一模式：从原先体积较大、混合 Python 控制和张量计算的方法中，把相对独立的张量逻辑抽成小方法，再在方法上挂 `@torch.compile()`，外层方法只负责选择参数并调用 helper。可减少 graph break、缩小 Dynamo 图并增加算子融合机会。`down_sample` 不计入这 7 项，见 U3。
+参考实现把 5 个大方法内联的逻辑拆成了 8 个纯张量 helper（`matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions`、`prepare_transformer_inputs`），每个单独挂 `@torch.compile()`。这 8 个名字是参考实现新增的，官方基线里不存在，`replace(target=...)` 找不到同名符号，没法直接声明成替换目标（原因见 §4.12）。
 
-| # | 新增 Helper | 原内联位置与抽取内容 | 优化方式 |
+**接入方式**：`reference.py` 把 8 个 helper 留作模块级纯函数，转而重写调用它们的 **5 个基线原生方法**（`maptrv2.reference_boundaries` group 的 5 个 `wrap` 目标），让新实现在内部调用 helper——调用方的输入输出契约不变，只是内部实现换掉，不新增、也不改动模型源码里的任何符号。
+
+**总体概述**：
+
+| # | 替换目标（`wrap`，基线原生符号） | 内部调用的 helper | 保留 eager 的部分 |
 | --- | --- | --- | --- |
-| 1 | `BaseTransform.matmul_1` | 从 `get_geometry_v1` 抽离逆后变换：`inverse(post_rots)` 乘 frustum 点，并执行齐次坐标的 `x*z, y*z, z` 重组 | 将矩阵乘和 `cat` 独立编译，避免与前后 host 逻辑混在同一大图 |
-| 2 | `BaseTransform.matmul_2` | 从 `get_geometry_v1` 抽离相机到 ego 的变换：合并 `rots @ inverse(intrins)`、矩阵乘点、平移 `trans` 和 `lidar2ego_trans` | 把连续 `matmul + add/sub` 放入同一编译边界，便于融合 elementwise 运算 |
-| 3 | `BaseTransform.matmul_3` | 从 `get_geometry_v1` 抽离 inverse `lidar2ego_rots` 对点的最后一次矩阵变换 | 独立编译纯矩阵计算，避免该段因外层控制流反复 graph break |
-| 4 | `BaseTransform.extract_metas` | 从 `BaseTransform.forward` 抽离 `img_metas` 的 Python 遍历，以及 `camera2ego`、内参、图像增强矩阵和 `lidar2ego` 的 numpy→tensor、stack、device/dtype 转换 | 集中管理 host-side 元数据组装，外层 `forward` 直接消费规整后的张量 |
-| 5 | `MapTRPerceptionTransformer.initialize_queries_and_bev` | 从 transformer `forward` 抽离 query split/expand、reference point 预测与 sigmoid、query/BEV 的 permute，以及静态 `spatial_shapes`/`level_start_index` 构造 | 缩小 transformer 主图的图边界，让 query 初始化可单独跟踪和编译 |
-| 6 | `MapTRv2Head.compute_decoder_predictions` | 从 head `forward` 抽离逐 decoder level 的分类、回归、`transform_box` 和 one-to-one/one-to-many 结果汇总循环 | 把逐层张量计算集中到独立编译单元；当前接入中 `seg_head`/`pv_seg_head` 留在 eager 侧，避免卷积进入该编译边界 |
-| 7 | `MapTRv2Head.prepare_transformer_inputs` | 从 head `forward` 抽离训练/推理的 `num_vec` 选择、query embedding、BEV query、位置编码和 `self_attn_mask` 构造 | 将配置分支和输入准备工作显式切出，使后续 transformer 段使用稳定的输入结构 |
+| B6.1 | `BaseTransform.get_geometry_v1` | `matmul_1` / `matmul_2` / `matmul_3` | frustum 缓存判断、`extra_rots`/`extra_trans` 可选分支 |
+| B6.2 | `BaseTransform.forward` | `extract_metas` | `get_geometry_v1`/`get_mlp_input`/`get_cam_feats` 调用、`bev_pool` 5D 布局校验 |
+| B6.3 | `LSSTransform.forward` | `down_sample` | 无（整段计算搬进 helper） |
+| B6.4 | `MapTRPerceptionTransformer.forward` | `initialize_queries_and_bev` | `get_bev_features`、`format_feats`、`decoder` 调用 |
+| B6.5 | `MapTRv2Head.forward` | `prepare_transformer_inputs`、`compute_decoder_predictions` | `compute_aux_seg_outputs`（分割头，依赖 `self.aux_seg[...]` 配置分支，刻意不进图） |
 
-以通用结构表示：
+**共用机制**：5 个 wrapper 在返回替换函数前都先调一次 `_prepare_helpers(options)`：
 
 ```python
-def large_forward(self, ...):
-    # Python 控制流、配置判断和输入组装
-    ...
-    result = self.compiled_helper(...)
-    ...
-    return result
+_COMPILED = {}
+_ACTIVE_MODE = None
 
-
-@torch.compile()
-def compiled_helper(self, ...):
-    # 相对独立的张量计算
-    ...
-    return result
+def _prepare_helpers(options):
+    global _ACTIVE_MODE
+    if os.getenv("TURBO_PHYSAI_DISABLE_TORCH_COMPILE", "0") == "1":
+        return
+    mode = options.get("mode", "max-autotune-no-cudagraphs")
+    _ACTIVE_MODE = mode
+    for name, function in _HELPERS.items():   # 一次性编译全部 8 个，不只是当前 wrapper 用到的
+        key = (name, mode)
+        if key not in _COMPILED:
+            _COMPILED[key] = torch.compile(function, mode=mode)
 ```
 
-这些拆分的核心收益不是增加算子，而是改变编译边界：Dynamo 不再试图编译包含 Python循环、list 拼接、numpy 转换或配置分支的整个大方法，只编译其中稳定的张量段，从而减少graph break 和无效重编译，并为 Inductor 创造更多融合机会。
+- **缓存全局共享**：8 个 helper 一次性编译进 `_COMPILED`，5 个 wrapper 里谁先跑到都会把全部 8 个编译好，其余几次调用直接命中缓存。`mode` 默认 `max-autotune-no-cudagraphs`，取自 group 的 `options`（当前是空字典），与 B5（`maptrv2.compile`）一致；5 个 wrap 共用同一份 `options`，没法单独改其中一个的 mode。
+- **`TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 是两层开关**：外层是 5 个 `wrap()` 共用的 `runtime_condition=compat.torch_compile_available`，引擎每次实际调用前都会查——变量一设，直接回退未改动的原始基线方法，`reference.py` 整段代码都不会跑；`_prepare_helpers` 内部对同一变量的判断是装载阶段的第二次检查，避免在明知用不上时还跑一遍 `torch.compile()`。
+- **`force_fp32` 只套 3 处，是复刻基线**：`get_geometry_v1`、`BaseTransform.forward`（基线 `encoder.py:121`/`:293` 本来就是 `@force_fp32()`）、`MapTRv2Head.forward`（基线 `@force_fp32(apply_to=('mlvl_feats','prev_bev'))`，只强转这两个参数）。`LSSTransform.forward`、`MapTRPerceptionTransformer.forward` 基线里本来就没有这个装饰器（前者的精度敏感部分已被它内部调用、已强制 fp32 的 `BaseTransform.forward` 覆盖），所以不套。`wrap`/`replace` 会连带原方法上的装饰器一起换掉，这里是手动把基线原有的装饰器复原，不是新加的保护。
+
+##### B6.1 `BaseTransform.get_geometry_v1` → `matmul_1` / `matmul_2` / `matmul_3`
+
+**概述**：把"图像系逆投影 → 相机系转 ego 系 → 转 lidar 系"这三段矩阵乘法，从一个大函数体拆成三个独立的纯张量函数，函数整体的输入输出契约不变。
+
+```
+优化前                                    优化后
+get_geometry_v1(...)                     get_geometry_v1(...)   ← 仍是同一个 wrap 目标
+  ├─ inverse(post_rots) 变换 frustum        ├─ matmul_1(...)     可单独编译/单独重编译
+  ├─ rots@inverse(intrins) 变换+平移        ├─ matmul_2(...)     可单独编译/单独重编译
+  └─ inverse(lidar2ego_rots) 变换            └─ matmul_3(...)     可单独编译/单独重编译
+  （三段写在同一个函数体里，只能整体 eager）     （三段各自是独立 FX 图，互不拖累）
+```
+
+本包实现（`reference.py`）：
+
+```python
+points = self.frustum - post_trans.view(batch, cameras, 1, 1, 1, 3)
+points = _helper("matmul_1")(self, torch.inverse(post_rots), points, trans)
+points = _helper("matmul_2")(self, rots, torch.inverse(intrins), trans, lidar2ego_trans, points)
+points = _helper("matmul_3")(self, torch.inverse(lidar2ego_rots), points, trans)
+```
+
+**优点**：三段矩阵乘法本身无副作用、无 Python 分支，是 Dynamo 编译成功率最高的一类代码；拆开后 Inductor 能分别对每段做算子融合，某一段因 shape 变化触发重编译也不会拖累另外两段。`extra_rots`/`extra_trans` 两个可选分支（配置不启用时恒为假）留在外层 `get_geometry_v1` 里 eager 判断，不进 helper。
+
+##### B6.2 `BaseTransform.forward` → `extract_metas`
+
+**概述**：把 `img_metas`（Python list，逐相机一个 dict）里的 `camera2ego`/`camera_intrinsics`/`img_aug_matrix`/`lidar2ego` 抠出来、numpy→tensor、`stack` 成 batched 张量的过程独立成一个 helper。
+
+```python
+def _stack_metas(metas, key, device, dtype):
+    tensors = []
+    for meta in metas:
+        value = meta[key]                     # 可能是 np.ndarray 或 list
+        if isinstance(value, np.ndarray):
+            value = torch.from_numpy(value)
+        elif isinstance(value, list):
+            value = torch.stack([...])
+        tensors.append(value)
+    return torch.stack(tensors, dim=0).to(device=device, dtype=dtype)
+```
+
+```
+BaseTransform.forward(images, img_metas)
+  ├─ extract_metas(...)            ← host-side 元数据组装，独立成 helper
+  ├─ self.get_geometry_v1(...)     ← B6.1
+  ├─ self.get_mlp_input(...)
+  ├─ self.get_cam_feats(...)
+  └─ _bev_pool_5d(...)             ← 附带的布局防御，见下
+```
+
+**为什么单独拆出来**：这段是 Python `for` 循环加 numpy↔tensor 转换，numpy 交互必然触发 graph break，本身就不适合进编译图；拆成独立 helper 后，至少能单独决定它是否编译，不拖累调用它的 `forward` 主体。
+
+**附带的 ROCm 防御**：这条路径内部的 `_bev_pool_5d` 对 `bev_pool` 输出做一次形状识别——NHWC `[B,Z,H,W,C]` 和 NCHW `[B,C,Z,H,W]` 两种都认，统一转成 NHWC 返回。这是**独立于** `maptrv2.bev_pool_fix`（另一条 ROCm layout 修正，见 §3.7.1/U3）的第二道防线，只作用于 `reference_boundaries` 这条调用路径，两者互不覆盖。
+
+##### B6.3 `LSSTransform.forward` → `down_sample`
+
+**概述**：参考实现的 `down_sample` 在基线里本来就没有对应的单一符号——collapse Z 轴的逻辑原本在 `BaseTransform.bev_pool` 尾部，`self.downsample` 调用原本在 `LSSTransform.forward` 里，是**两个文件两个方法**分开写的（详细的载体分析见 §4.12）。本包把两段合成一个 helper：
+
+```python
+def down_sample(self, x):
+    x = x.permute(0, 4, 1, 2, 3).contiguous()
+    x = torch.cat(x.unbind(dim=2), 1)      # collapse Z
+    x = x.permute(0, 1, 3, 2).contiguous()
+    return self.downsample(x)
+```
+
+```
+优化前（两个文件两个方法各管一段）              优化后（合成一个 helper，整段可编译）
+BaseTransform.bev_pool:  collapse Z          LSSTransform.forward:
+LSSTransform.forward:    self.downsample(x)    bev = down_sample(self, features)
+```
+
+**优点**：collapse-Z 的 `permute`+`cat`+`permute` 和随后的 `self.downsample`（Conv2d）现在是同一个可编译单元，不需要在两个函数之间来回切换 eager/graph 状态。
+
+##### B6.4 `MapTRPerceptionTransformer.forward` → `initialize_queries_and_bev`
+
+**概述**：把 query/query_pos 的 split+expand、`reference_points` 预测+sigmoid、query/BEV 的 permute，以及静态 `spatial_shapes`/`level_start_index` 构造这段初始化逻辑拆出来。
+
+```python
+def initialize_queries_and_bev(self, object_query_embed, bev_embed, batch_size, bev_h, bev_w):
+    query_pos, query = torch.split(object_query_embed, self.embed_dims, dim=1)
+    query_pos = query_pos.unsqueeze(0).expand(batch_size, -1, -1)
+    query = query.unsqueeze(0).expand(batch_size, -1, -1)
+    reference_points = self.reference_points(query_pos).sigmoid()
+    query = query.permute(1, 0, 2); query_pos = query_pos.permute(1, 0, 2)
+    bev_embed = bev_embed.permute(1, 0, 2)
+    spatial_shapes = torch.tensor([[bev_h, bev_w]], device=query.device)
+    level_start_index = torch.tensor([0], device=query.device)
+    return query, bev_embed, query_pos, reference_points, spatial_shapes, level_start_index, reference_points
+```
+
+```
+transformer_forward(...)
+  ├─ get_bev_features(...)               ← BEV 编码器，留 eager（体积大、含控制流）
+  ├─ initialize_queries_and_bev(...)     ← 拆出的纯张量段，可编译
+  ├─ self.format_feats(...)
+  └─ self.decoder(...)                   ← decoder 主体，留 eager（含注意力）
+```
+
+**优点**：这段全是 tensor split/expand/permute，没有 Python 分支，独立编译能缩小 transformer 主 `forward` 的图边界；体积大、含控制流的 `get_bev_features` 和 `decoder` 不强行进图。
+
+##### B6.5 `MapTRv2Head.forward` → `prepare_transformer_inputs` + `compute_decoder_predictions`
+
+**概述**：head 的 `forward` 拆成两段可编译 helper：一段是"decoder 之前的输入准备"（`prepare_transformer_inputs`：按 `query_embed_type` 选路径、构造 BEV query/位置编码、构造 one2one/one2many 的 `self_attn_mask`），一段是"decoder 输出之后的逐层后处理"（`compute_decoder_predictions`：`inverse_sigmoid` + cls/reg branch + sigmoid + one2one/one2many 切分）。
+
+```
+head_forward(...)
+  ├─ prepare_transformer_inputs(...)        ← 配置态组装，可编译
+  ├─ self.transformer(...)                  ← 见 B6.4
+  ├─ compute_decoder_predictions(...)       ← 逐层张量后处理，可编译
+  └─ compute_aux_seg_outputs(...)           ← 分割头，刻意留 eager（见下）
+```
+
+`compute_aux_seg_outputs` **不进编译**：它依赖 `self.aux_seg["use_aux_seg"]`/`["bev_seg"]`/`["pv_seg"]` 三层配置分支，进图会导致 graph break；本包按参考实现同样的取舍，把它单独列成一个 eager-only 函数，不参与 `_prepare_helpers` 缓存。`head_forward_wrapper` 额外套 `force_fp32(apply_to=("mlvl_feats", "prev_bev"))`，只强转这两个参数。
+
+**优点**：`for level in range(hidden_states.shape[0])` 这段逐层循环加 `list.append` 汇总现在是独立编译单元，不再和"要不要跑分割头"这类配置判断混在同一张图里。
 
 
 
-#### B6. `cdist` 替换为广播减法
+#### B7. `cdist` 替换为广播减法
 
 `projects/mmdet3d_plugin/maptr/losses/map_loss.py`
 ```diff
@@ -245,7 +369,7 @@ def compiled_helper(self, ...):
 
 **优点**：`torch.cdist` 在 ROCm/DCU 上算子覆盖差且反传路径不稳；改成显式广播减+求和后走通用 elementwise/reduce kernel，正反向都稳定，同时对 dynamo/compile 更友好。
 
-#### B7. Assigner 静态化与 Hungarian 隔离
+#### B8. Assigner 静态化与 Hungarian 隔离
 
 `projects/mmdet3d_plugin/maptr/assigners/maptr_assigner.py`
 
@@ -471,7 +595,7 @@ AssertionError: expected size 256==256, stride 375==1 at dim=1
 
 服务器验证：仅上传 `assigner.py` 修改后，训练已可正常启动，说明问题由 Assigner默认编译路径引起，修复不依赖模型源码或其他优化 Group。已增加默认 eager 路径回归测试。
 
-#### B8. EfficientNet 注册覆盖
+#### B9. EfficientNet 注册覆盖
 
 `projects/mmdet3d_plugin/models/backbones/efficientnet.py`
 ```diff
@@ -482,7 +606,7 @@ AssertionError: expected size 256==256, stride 375==1 at dim=1
 
 **优点**：容器镜像里 mmcls / mmdet 可能已注册同名 backbone；`force=True` 保证 MapTR 版本覆盖，避免 registry 冲突报错。
 
-#### B9. 强制选择 CUDAExtension 构建
+#### B10. 强制选择 CUDAExtension 构建
 
 权威版本**没有新增** `.hip` 文件，源文件仍是原有的
 `geometric_kernel_attn_cuda.cu`。实际 diff 只有：
@@ -502,10 +626,12 @@ AssertionError: expected size 256==256, stride 375==1 at dim=1
 把已有的 `.cu` 文件加入构建；在 ROCm PyTorch 环境中，该分支由 ROCm 扩展构建链处理。
 
 **注意**：这不会让纯 CPU 环境自动生成可用算子，只是绕过 Python 层的设备可用性判断；
-后续仍需要可用的 CUDA/HIP 编译工具链。**未接入原因**：这是构建脚本改造，不是运行时函数替换，
-因此不能通过 recipe 管理。
+后续仍需要可用的 CUDA/HIP 编译工具链。
 
-#### B10. PV 掩码向量化重采样
+**接入方式**：这是构建脚本改造，不是运行时函数替换，所以不能通过 recipe 管理，改由
+`build.py:163 force_geometric_kernel_extension()` 以离线补丁形式覆盖（见 §3.7.2 K1）。
+
+#### B11. PV 掩码向量化重采样
 
 `nuscenes_offlinemap_dataset.py` 的 `VectorizedLocalMap.line_ego_to_pvmask`：
 
@@ -548,7 +674,7 @@ AssertionError: expected size 256==256, stride 375==1 at dim=1
 300/300 掩码逐像素相同，非零 `origin` 下坐标严格相等（见 §4.11 与包内 README）。同文件 `gen_vectorized_samples` 里的 `LineString(np.array(instance))` → `LineString(instance)`
 **仍未覆盖**：该方法约 90 行且控制流密集，为省一次顶点拷贝整体替换不划算，理由记在该包 README 的「不在本包范围内的参考实现改动」。
 
-#### B11. NUMA 亲和启动
+#### B12. NUMA 亲和启动
 
 优化侧新增了一个启动脚本，把每个 rank 绑到该 DCU 所属的 NUMA 节点上：
 
@@ -569,7 +695,7 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 
 
 
-#### B12. FP32 Matmul 精度配置
+#### B13. FP32 Matmul 精度配置
 
 `projects/mmdet3d_plugin/maptr/modules/encoder.py` 顶部（紧随 import）：
 
@@ -583,7 +709,7 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 **优点**：允许 cuBLAS / hipBLASLt 在 fp32 GEMM 上选 TF32 等同级内核，`LSSTransform`里的 `torch.matmul`（`matmul_1/2/3`、`get_geometry`、`bev_pool`）与 attention 的`QK^T` / `PV` 直接受益，精度损失通常在小数点后 3 位量级。**归属**：TurboPhysAI 收进
 `maptrv2.training`（`training.py` 的 `_matmul_precision`），默认 `high`，可用`TURBO_PHYSAI_MATMUL_PRECISION=off` 回到 torch 默认的 `highest`。
 
-#### B13. lightop DCU 自定义 Deformable Attention Kernel
+#### B14. lightop DCU 自定义 Deformable Attention Kernel
 
 `projects/mmdet3d_plugin/bevformer/modules/multi_scale_deformable_attn_function.py`
 
@@ -602,7 +728,7 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 
 **归属**：这是运行时 import 级别的替换，写在模型源码中。TurboPhysAI 的通用 `mmcv.msda` Group patch 的是 mmcv 层的符号，与 lightop 是不同路径；若 lightop 已安装则 mmcv.msda 不会在关键路径生效。**当前未通过 TurboPhysAI recipe 管理**，属于需要随模型源码部署 lightop 库的硬件适配项。
 
-#### B14. MIOpen / rocBLAS 运行时调优
+#### B15. MIOpen / rocBLAS 运行时调优
 
 > 背景知识
 
@@ -702,7 +828,7 @@ export ROCBLAS_MATH_MODE=1
    `models.opt.adamw.AdamW2` 只存在于参考实现，官方 `maptrv2` 分支没有；
 2. **实现按能力分模块**（`training.py`/`data.py`/`grid_mask.py`/`compile.py`/`match_cost.py`/
    `pv_mask.py` + `compat.py`），没有再建 `replacements/` 子包；
-3. **新增 B10**（PV 掩码重采样），草稿里没有。
+3. **新增 B11**（PV 掩码重采样），草稿里没有。
 
 逐条对照表见该包 `README.md` 的「与 `note.md` §2.2 草案的差异」，实际声明见 §2.2b。
 
@@ -723,9 +849,9 @@ maptrv2_optimization/
 │   ├── training.py                  # B1/B2：channels-last、cuDNN、fork
 │   ├── data.py                      # B3 + fork 修复：pin_memory、DataLoader 级 multiprocessing_context
 │   ├── grid_mask.py                 # B4：Dynamo 安全的 GridMask.forward
-│   ├── compile.py                   # B5/B7：compile_wrapper / dynamo_disable_wrapper
-│   ├── match_cost.py                # B6：cdist(p=1) → 广播减法
-│   ├── pv_mask.py                   # B10：PV 重采样 + BEV 掩码变换合并
+│   ├── compile.py                   # B5/B8：compile_wrapper / dynamo_disable_wrapper
+│   ├── match_cost.py                # B7：cdist(p=1) → 广播减法
+│   ├── pv_mask.py                   # B11：PV 重采样 + BEV 掩码变换合并
 │   └── replacements.py              # 实现索引（只有文档字符串，供人读）
 ├── pyproject.toml
 ├── README.md                        # Group 表、差异说明、上机步骤
@@ -734,9 +860,9 @@ maptrv2_optimization/
     └── test_implementations.py      # 与官方实现的数值等价（unittest）
 ```
 
-B8（EfficientNet）不占模块：它由 `registry_override` 在 catalog 里直接声明。
+B9（EfficientNet）不占模块：它由 `registry_override` 在 catalog 里直接声明。
 
-B9（强制选择 `CUDAExtension`）**不通过 recipe yaml 管理**，因为它是扩展构建逻辑而不是
+B10（强制选择 `CUDAExtension`）**不通过 recipe yaml 管理**，因为它是扩展构建逻辑而不是
 运行时替换。若后续要提供独立算子实现，应把 kernel 源码放到
 `TurboPhysAI/kernel/geometric_kernel_attn/`，Python wrapper 放到
 `turbo_physai/operators/geometric_kernel_attention.py`，再通过 `replace` 引用；不能把权威
@@ -825,7 +951,7 @@ COMPILE_HOOKS = group(
     runtime_condition="turbo_physai.optimizations.models.maptrv2_optimization.compat.torch_compile_available",
 )
 
-# B6
+# B7
 CDIST_BBOX_COST = group(
     "maptrv2.cdist_bbox_cost",
     replace(
@@ -834,7 +960,7 @@ CDIST_BBOX_COST = group(
     ),
 )
 
-# B7 —— 注意会改变 assign() 的调用约定，需要同步替换调用侧的 GT 打包函数
+# B8 —— 注意会改变 assign() 的调用约定，需要同步替换调用侧的 GT 打包函数
 ASSIGNER_STATIC = group(
     "maptrv2.assigner.static_hungarian",
     replace(
@@ -851,7 +977,7 @@ ASSIGNER_STATIC = group(
     ),
 )
 
-# B8
+# B9
 EFFICIENTNET_FORCE = group(
     "maptrv2.efficientnet.force_register",
     wrap(
@@ -997,6 +1123,14 @@ def hungarian_match(self, cost, gt_labels, assigned_gt_inds, assigned_labels, nu
 
 ### 2.4 Recipe 配置
 
+> **这是动手前的草案，不是当前生效的配置。** 草案里的 group id（`maptrv2.channels_last`、
+> `maptrv2.cudnn_flags`、`maptrv2.dataloader.pin_memory`、`maptrv2.grid_mask.dynamo_safe`、
+> `maptrv2.cdist_bbox_cost`、`maptrv2.efficientnet.force_register`、
+> `maptrv2.assigner.static_hungarian`、`maptrv2.torch_compile`）与 `extends` 的三条并列 id
+> 都没有落地。实际生效的是 `configs/recipe.yaml`（手写源）与 `configs/optimization.yaml`
+> （生成产物），group id 为 12 个 `maptrv2.*`，`extends` 处于注释状态——对照 §2.6 与 §3.8.4。
+> 下面保留草案原文，用于说明设计意图与最终形态的差异。
+
 ```yaml
 schema_version: turbophysai/optimization-config/v1
 kind: OptimizationConfig
@@ -1068,6 +1202,63 @@ turbo-physai run \
 
 `turbo_physai/optimizations/common/{mmcv,mmdet3d}` 已提供通用替换（`mdc`、`msda`、`bev_pool`、`voxelization` 等）。若 MapTRv2 用到，**只通过 `extends` 引用**，不要在本包重复声明。
 
+**设计上的继承链**（`extends` 只有一层 `common.hcu.base`，不是本节最初设想的 `common.hcu.base`/`common.mmcv.hcu`/`common.mmdet3d.hcu` 三个并列 id——那三个 id 在 §2.4 的草稿 YAML 里出现过，是没有落地的早期设计）：
+
+```
+maptrv2 的 recipe.yaml（id: model.maptrv2.development.hcu）
+  extends: common.hcu.base
+      │
+      ▼
+common/configs/recipe.yaml（id: common.hcu.base）
+  extends:
+    - framework.mmcv.hcu
+    - framework.mmdet3d.hcu
+      │
+      ├──▼ common/mmcv/configs/optimization.yaml（id: framework.mmcv.hcu）
+      │     optimization_modules: [...common.mmcv.catalog]
+      │     optimization_groups:
+      │       - id: mmcv.msda, enabled: true
+      │
+      └──▼ common/mmdet3d/configs/optimization.yaml（id: framework.mmdet3d.hcu）
+            optimization_groups:
+              - mmdet3d.gaussian
+              - mmdet3d.bev_pool
+              - mmdet3d.quick_cumsum
+              - mmdet3d.voxelization
+              - mmdet3d.canonical_indice_pairs
+              - mmdet3d.sparse_tensor
+```
+
+解析机制在 `turbo_physai/engine/config/loader.py`：`OptimizationConfigCatalog.from_builtin_files()` 启动时 glob 全部 `optimizations/**/configs/optimization.yaml`，按各自 `metadata.id` 注册进同一个目录；`_resolve_extends()` 递归取出 `extends` 列出的父配置先展开，再用 `_merge()` 按 group `id` 去重合并（子配置同 id 覆盖父配置字段，否则原样带过来），`optimization_modules` 同样合并去重。所以继承链接通时，最终 `configs/optimization.yaml` 底部会列出三个模块。
+
+> **注意：这条链当前处于断开状态。**
+> `maptrv2_optimization/configs/recipe.yaml:18-20` 里 `extends` 整段被注释掉：
+>
+> ```yaml
+> # extends:
+> #   # 继承自 common.hcu.base 配置，包含了基础的优化配置和通用设置
+> #   - common.hcu.base
+> ```
+>
+> 因此生成的 `optimization.yaml` **没有 `extends` 键**，`optimization_modules` 只有一行
+> （`optimization.yaml:183-184`）：
+>
+> ```yaml
+> optimization_modules:
+> - turbo_physai.optimizations.models.maptrv2_optimization.catalog
+> ```
+>
+> 上面那张图描述的是**设计意图**，不是当前生效的状态。在当前配置下，
+> `mmcv.msda` 与 6 个 `mmdet3d.*` 这 7 个框架层 group **不会被激活**——这是 §3.6.2
+> 「核实结论」需要随之改写的原因。同族的 `bevformer/configs/recipe.yaml:14-15` 与
+> `bevfusion/configs/recipe.yaml:14-15` 仍然接着这条链，只有 MapTRv2 的 recipe 断开了
+> （MapTRv2 自己用 `maptrv2.bev_pool_fix` 等专属 group 覆盖了同一条路径，见 §3.7.1 U3）。
+>
+> 另外 `common/mmcv/catalog.py:11-25` 定义了一个 `mmcv.mdc` group，但它**没有被任何
+> 配置文件的 `optimization_groups` 引用**，属于定义了但从未启用的项。
+
+`maptrv2_optimization/catalog.py` 的 `__all__` 列出 12 个 `maptrv2.*` group；`mmcv.msda` 和 6 个 `mmdet3d.*` group 的定义（`id`、`optimization_modules`、默认 `enabled`）完全来自这条 `extends` 链，本包代码里既不定义也不注册它们。继承链一旦重新接通，它们会被并入最终生成的配置；当前断开状态下则完全不在配置里。
+
 ---
 
 ## 3. 实施要点
@@ -1085,8 +1276,8 @@ turbo-physai run \
 
 ### 3.2 Assigner 静态化约束
 
-**结论：`maptrv2.assigner` 默认关闭。** 完整静态化不是替换一个函数，而是修改 head 和
-assigner 之间的数据契约。
+**结论：`maptrv2.assigner` 不是一个函数替换，而是 head 与 assigner 之间的数据契约改造，
+所以它必须一次性覆盖整条调用链。**
 
 ```text
 基线调用约定
@@ -1104,13 +1295,19 @@ MapTRv2Head._get_target_single
 固定 shape 有利于 Dynamo，但上游必须同步产出“预 pad + valid mask + num_gts”三元组，
 否则会在 assigner 内发生 shape 不匹配。完整改造还会涉及`loss`、`get_targets`、`_get_target_single`、`assign`、`sampler.sample` 等多处调用方，少改一处就可能静默出错，无法用一个原子替换安全表达。
 
-本包只落地可独立验证的部分：用 `torch._dynamo.disable` 把 SciPy Hungarian 求解隔离出
-Dynamo 图，行为与官方实现一致，但仍默认关闭。
+本包的落地方式是在 `assigner.py` 里实现完整契约，再用 3 个 `replace` 目标一次性覆盖这条链：
+`MapTRAssigner.assign`、`MapTRv2Head.loss`、`MapTRv2Head._get_target_single`。其中
+`pad_to_static_list` 负责产出"预 pad + valid mask + num_gts"三元组，`_hungarian_match_impl`
+用 `torch._dynamo.disable` 把 SciPy 求解隔离出 Dynamo 图。详见 §3.7.1 U4。
 
 ```yaml
 - id: maptrv2.assigner
-  enabled: false  # 开启前必须做业务级精度 A/B
+  enabled: true
 ```
+
+`assign` 自身的 `torch.compile` 不在这三个目标的行为里，由
+`TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 单独控制，默认 `"0"`（不编译）；开启前应做业务级
+精度 A/B。
 
 ### 3.3 `runtime_condition` 机制
 
@@ -1195,7 +1392,7 @@ turbo-physai run \
   python tools/train.py <原训练参数>
 ```
 
-`generate` 会校验仓库状态、commit 和每个 `target`，所以基线符号不存在时会在此处直接报错。训练跑通后，再逐个打开默认关闭的 `maptrv2.compile`、`maptrv2.assigner`，分别与基线对齐loss 曲线和 nuScenes mAP，并记录性能数据。
+`generate` 会校验仓库状态、commit 和每个 `target`，所以基线符号不存在时会在此处直接报错。训练跑通后，`maptrv2.compile` / `maptrv2.reference_boundaries` / `maptrv2.assigner` 在配置里已经是 `enabled: true`（§3.8.4），所以 A/B 的做法是**逐个改成 `enabled: false` 取对照组**，分别与基线对齐 loss 曲线和 nuScenes mAP，并记录性能数据。
 
 **当前状态**：删除非权威扩展前，`maptrv2_optimization/` 下 12 个 `.py` 已通过`python -m py_compile`；Python 3.11 + CPU torch 2.14 + numpy/shapely/opencv/pillow 环境下，上述两个测试文件得到 **30 passed、53 subtests passed、0 skipped**。测试用最小 `mmcv` 桩替代
 `runner.auto_fp16`，GridMask 的装饰器组合及 HCU 路径尚未实测。删除相关代码后需要重新执行定向测试。所有 `target` 已在基线 worktree `e03f097` 定位到定义行，Group ID、recipe 和环境变量保持一致。`generate/check/run`、训练级精度/性能 A/B 仍需上机完成。核对期间还修正了两处测试缺陷：`project_points` 的期望值补上官方 `perspective()` 的 `+ 1e-7`；`MatchCost` 由 float32
@@ -1212,9 +1409,9 @@ turbo-physai run \
 
 ### 3.6 参考实现覆盖审计
 
-以`/hygon-hub/models/MapTRv2/MapTRv2` 为准，使用`git diff --no-index --ignore-space-at-eol` 对比 `MapTR_v2@e03f097`，并额外检查`mmdetection3d/`、镜像构建和启动脚本。排除 `.git` 后，源码级差异共 46 个文件：`projects/` 26 个、`mmdetection3d/` 14 个、`tools/` 4 个，以及 `docs/install.md`、根目录`test.py` 各 1 个。
+以本地 `/workspace/MapTRv2`（侵入式优化版）为准，对照本地未优化基线 `/workspace/model/MapTrv2`，使用 `diff -rq` / `diff -u` 逐文件比对，并额外检查 `mmdetection3d/`、镜像构建和启动脚本。
 
-结论：**主要优化已经拆出，但没有全部等价接入 TurboPhysAI**。
+结论：**主要优化已经拆出并接入 TurboPhysAI，但仍有若干缺口，且部分接入项在当前配置下有冗余或旁路**。本节的逐条核实口径见 §3.8 的三方差分审计。
 
 #### 3.6.1 MapTRv2 主体改动
 
@@ -1225,97 +1422,154 @@ turbo-physai run \
 | cuDNN benchmark / deterministic、fork | B2 | 已接入 `maptrv2.training`，均有独立 env 开关 |
 | `pin_memory=True` | B3 | 已接入 `maptrv2.data` |
 | GridMask dynamo 隔离、只读 numpy buffer 修复 | B4 | 已接入 `maptrv2.grid_mask`；额外改为 `x.device`，不复用参考实现的硬编码 `.cuda()` |
-| 10 个基线同名 `@torch.compile()` 挂点 | B5、§2.2b | 已在 `maptrv2.compile` 声明，但 Group 默认关闭；参考实现使用无参 `torch.compile()`，本包默认 `max-autotune-no-cudagraphs` |
-| 另外 8 个新 helper 挂点 | B5、§4.12 | **未接入**：`matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions`、`prepare_transformer_inputs` 在基线中不存在，需要先改模型源码或包装更大的外层方法 |
-| `cdist` 改广播减法 | B6 | 已接入 `maptrv2.match_cost` |
-| assigner 静态打包 + Hungarian 隔离 | B7、§4.13 | **部分接入**：只把整个 `assign` 做 `torch._dynamo.disable`；参考实现的 `pad_to_static_list`、`_get_target_single`/sampler 契约、`hungarian_match` 和 `@torch.compile` 均未等价实现 |
-| EfficientNet `force=True` 注册 | B8 | 已通过 `registry_override` 接入 `maptrv2.efficientnet` |
-| 强制选择 `CUDAExtension` 构建 | B9 | **未接入**：权威版本只修改 `setup.py`，没有新增 HIP 源；构建逻辑无法通过 recipe 原子替换 |
-| PV mask numpy 重采样、BEV affine 合并 | B10 | 已接入 `maptrv2.pv_mask` |
-| `LineString(np.array(instance))` → `LineString(instance)` | B10 | **未接入**：仅为省一次顶点拷贝，承载方法约 90 行且控制流密集，当前未为它单独替换 |
-| NUMA rank 绑定 | B11 | 已映射到 RuntimeConfig `process.numa` |
-| `set_float32_matmul_precision("high")` | B12 | 已接入 `maptrv2.training` |
-| head 中 `get_label_result`、`pad_to_static_list` 抽取 | B7、§4.13 | **未接入**，属于静态 assigner 的同一批跨文件改造 |
-| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5、§4.12 | **部分接入**：ROCm `bev_pool` 实际返回 `[B,Z,H,W,C]` 而非 CUDA 的 `[B,C,Z,H,W]`，导致后续 `downsample` Conv2d channel 维不匹配崩溃。已通过 `maptrv2.bev_pool_fix`（`bev_pool_fix.py`）在 monkey-patch 层修正 layout，不改动 `encoder.py`；参考实现的「把 collapse Z 移入新 `down_sample`」编译优化仍未接入 |
-| `lightop` DCU Deformable Attention 算子替换 | B13 | **未接入 TurboPhysAI recipe**：以 try/except 写在模型源码中；`mmcv.msda` 替换的是 mmcv 层符号，与 lightop 路径不重叠 |
+| 10 个基线同名 `@torch.compile()` 挂点 | B5、§2.2b | 已在 `maptrv2.compile` 声明且 `enabled: true`；参考实现 18/19 个挂点用 `mode="max-autotune-no-cudagraphs"`，与本包默认 mode **一致** |
+| 另外 8 个新 helper 挂点 | B6、§4.12 | **已接入且 `enabled: true`**：`matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions`、`prepare_transformer_inputs` 在基线中不存在，无法直接声明为 `replace` 目标；`maptrv2.reference_boundaries` group 改为包装 5 个基线原生调用方（`get_geometry_v1`/`BaseTransform.forward`/`LSSTransform.forward`/`transformer.forward`/`head.forward`），让新实现内部调用这 8 个 helper，不改模型源码 |
+| `cdist` 改广播减法 | B7 | 已接入 `maptrv2.match_cost` |
+| assigner 静态打包 + Hungarian 隔离 | B8、§4.13 | **已接入**：`assigner.py` 实现了 `pad_to_static_list`、`get_label_result`、`_hungarian_match_impl`（`torch._dynamo.disable` 隔离 SciPy 求解）、`static_loss`、`get_target_single`，通过 `maptrv2.assigner` 的 3 个 `replace` 目标（`assign`/`loss`/`_get_target_single`）落地。唯一差异：参考对 `assign` 用 `@torch.compile(options={"triton.cudagraphs": True, "triton.cudagraph_trees": False})`，本包由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制且**默认 `"0"`（不编译）**，编译选项也不同 |
+| EfficientNet `force=True` 注册 | B9 | 已通过 `registry_override` 接入 `maptrv2.efficientnet` |
+| SparseConv 全部 `register_module(force=True)` | §3.6.2 | 已通过 `registry_override` 接入 `maptrv2.spconv_registry`；但**当前运行时环境中是空操作**——实际导入的 mmdet3d 是 dist-packages 里那个由参考树构建的 wheel，它本身已经带 `force=True`（见 §3.6.2、§3.8） |
+| 数据集向量化第二梯队（`_interpolate_line_points_vectorized`、`shift_fixed_num_sampled_points_v2` 缓存） | §3.7.1 U6 | **未接入**：`pv_mask.py` 只覆盖 `line_ego_to_pvmask`/`line_ego_to_mask`/`gen_vectorized_samples`，没有 patch 这两个 |
+| DDP `ddp_static_graph=True` + `find_unused_parameters=False` | §3.7.1 U7 | **已接入** `maptrv2.ddp_static_graph`：基线 `mmdet_train.py` 没有 `ddp_static_graph` 字段，config 改不动，所以改为 wrap `mmcv.parallel.distributed.MMDistributedDataParallel.__init__`，在构造点注入 |
+| GDK `geometric_kernel_attn_cuda.cu` 的 `AT_DISPATCH_FLOATING_TYPES(value.type(), …)` → `value.scalar_type()` | §3.7.2 K3 | **未接入**：`build.py` 覆盖了其它构建补丁，但不含这条 `.cu` 改动 |
+| 强制选择 `CUDAExtension` 构建 | B10 | **已接入（离线构建补丁，非 recipe）**：`build.py:163 force_geometric_kernel_extension()` 对 `geometric_kernel_attn/setup.py` 做同一个 `if 1:` 替换；因为目标是构建脚本而不是运行时函数，走 `python -m ...build` 而不是 group |
+| PV mask numpy 重采样、BEV affine 合并 | B11 | 已接入 `maptrv2.pv_mask` |
+| `LineString(np.array(instance))` → `LineString(instance)` | B11 | **已接入**：随 `maptrv2.pv_mask` 的 `gen_vectorized_samples` 替换一起落地（`pv_mask.py` 中即 `LineString(instance)`），不需要为它单独设 group |
+| NUMA rank 绑定 | B12 | 已映射到 RuntimeConfig `process.numa` |
+| `set_float32_matmul_precision("high")` | B13 | 已接入 `maptrv2.training` |
+| head 中 `get_label_result`、`pad_to_static_list` 抽取 | B8、§4.13 | **已接入**：两者都在 `assigner.py` 中实现（而不是作为 head 的新方法），由 `maptrv2.assigner` 的 `loss` / `_get_target_single` 替换在内部调用 |
+| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5/B6.3、§4.12 | **已接入，但当前配置下 `bev_pool_fix` 被旁路**：ROCm `bev_pool` 返回 `[B,Z,H,W,C]` 而非 CUDA 的 `[B,C,Z,H,W]`，会让后续 `downsample` Conv2d channel 维不匹配崩溃。`maptrv2.bev_pool_fix` 在 monkey-patch 层修正 layout 并顺带做了参考的 `index_select`→`x[kept]` 布尔掩码替换。`down_sample` 的 collapse-Z+downsample 合并通过 `maptrv2.reference_boundaries` 的 `LSSTransform.forward`/`BaseTransform.forward` 包装接入（见 B6.3），现在 `enabled: true`。**两者是同一段逻辑的两个实现，而 `reference_boundaries` 的 `base_transform_forward` 直接调 `_bev_pool_5d`、不再走 `self.bev_pool`，所以 Group 全开时 `bev_pool_fix` 在主训练路径上是死代码**（它仍是 `reference_boundaries` 关闭时的兜底）。详见 §3.8 |
+| `lightop` DCU Deformable Attention 算子替换 | B14 | **未接入 TurboPhysAI recipe**：以 try/except 写在模型源码中；`mmcv.msda` 替换的是 mmcv 层符号，与 lightop 路径不重叠 |
 
 #### 3.6.2 `mmdetection3d` 与部署层
 
 | 参考实现改动 | 当前处理 |
 | --- | --- |
-| `mmdet3d.ops.bev_pool.bev_pool` 去掉尾部 `permute(0,4,1,2,3)` | **未按参考契约接入**。recipe 通过 `common.hcu.base` 启用了通用 `mmdet3d.bev_pool`，但通用实现仍返回 4D，和参考实现“返回 5D 后交给 `down_sample`”不是同一改造 |
-| SparseConv 系列全部 `register_module(force=True)` | **未接入**；与 EfficientNet 同类，可在通用 `mmdet3d` 层增加 registry override |
-| 多个 point ops 去掉 `THC/THC.h`、改用 `ATen/cuda/CUDAContext.h` | **未接入 PhysAI**；属于 mmdet3d/CUDA 扩展的 PyTorch 版本兼容修补 |
-| `__CUDA_ARCH__` → `__CUDACC__`、C++14 → C++17 | **未接入 PhysAI**；属于扩展构建兼容 |
-| mmcv 上限 1.4.0 → 1.6.2、numba import、requirements 版本解绑 | **未接入 PhysAI**；属于镜像/依赖环境适配，不应做成 recipe Group |
-| `start_mmdet3d.sh` 的 MIOpen、rocBLAS、NCCL、Inductor、HSA 环境变量 | **已按参考启动脚本写入 MapTRv2 runtime**：MIOpen/rocBLAS 部分见 B14；这些是参考环境的调优默认值，不代表每项都是运行必需，RCCL 拓扑项需按实际部署覆盖 |
+| `mmdet3d.ops.bev_pool.bev_pool` 去掉尾部 `permute(0,4,1,2,3)` | **在运行时已经生效，但来源不是本包**：当前安装的 mmdet3d wheel 由参考树构建，其 `bev_pool.py:96` 已经是注释态并 `return x`（5D）（见 §3.8.1）。package 侧对应的是 `maptrv2.bev_pool_fix`（默认开启）与 `maptrv2.reference_boundaries` 的 `_bev_pool_5d`，两者都按 5D 处理；`common.hcu.base` 那条通用 `mmdet3d.bev_pool` group 当前未接线 |
+| SparseConv 系列全部 `register_module(force=True)` | **已接入** `maptrv2.spconv_registry`（registry_override）；但当前运行时 mmdet3d wheel 本身已带 `force=True`，实际是空操作，见 §3.7.1 U8 |
+| 多个 point ops 去掉 `THC/THC.h`、改用 `ATen/cuda/CUDAContext.h` | **已接入**：`build.py` 的 `_point_op_patches()` 补 `#include <ATen/cuda/CUDAContext.h>`；属构建层，不做成 Group |
+| `__CUDA_ARCH__` → `__CUDACC__`、C++14 → C++17 | **已接入**：`build.py` 的 `_build_compatibility_patches()` 覆盖这两项；属构建层 |
+| mmcv 上限 1.4.0 → 1.6.2、numba import、requirements 版本解绑 | **已接入**：`build.py` 覆盖 `mmcv_maximum_version`、`numba.errors`→`numba.core.errors`、放开 numba 版本锁定；属镜像/依赖层，不做成 recipe Group |
+| `start_mmdet3d.sh` 的 MIOpen、rocBLAS、NCCL、Inductor、HSA 环境变量 | **已按参考启动脚本写入 MapTRv2 runtime**：MIOpen/rocBLAS 部分见 B15；这些是参考环境的调优默认值，不代表每项都是运行必需，RCCL 拓扑项需按实际部署覆盖 |
 | Dockerfile、空 `build.sh`、数据下载脚本 | **不纳入模型优化包**；属于镜像和部署资产 |
 | 根目录新增 `test.py` | **不纳入模型优化包**；内容是临时 CUDA tensor 构造试验 |
+
+**前提：运行时真正导入的 mmdet3d 不是仓库树。** `import mmdet3d` 解析到
+`/usr/local/lib/python3.10/dist-packages/mmdet3d`（0.17.2）；该安装的 `direct_url.json` 为
+`file:///workspace/MapTRv2/mmdetection3d/dist/mmdet3d-0.17.2-...whl`——**这个 wheel 是用侵入式参考树构建的**。
+证据一致：安装版 `ops/bev_pool/bev_pool.py:96` 已经是
+`#x = x.permute(0, 4, 1, 2, 3).contiguous()`，安装版 `ops/spconv/conv.py` 的 10 处
+`register_module(force=True)` 已经存在。基线自带的 `mmdetection3d/` 子目录（`bev_pool.py` 仍是
+`x = x.permute(...)`、spconv 0 处 `force=True`）**不被导入**，只是构建资产。
+下表描述的是**仓库树**里的代码，用来对照参考实现的 diff；判断运行时行为要以上面这个 wheel 为准。
+
+**核实结论**：§2.6 那条 `extends` 链带来的 7 个框架层公共优化（`mmcv.msda` + 6 个 `mmdet3d.*`），
+在**当前配置下根本没被激活**——`recipe.yaml:18-20` 的 `extends` 整段被注释，生成的
+`optimization.yaml` 无 `extends` 键，只有 `maptrv2.*` 一个模块。所以这 7 个 group 既不来自
+模型源码，也不在生效配置里：
+
+| Group | 目标符号 | 仓库源码树里的状态（不等于运行时，见上） |
+| --- | --- | --- |
+| `mmdet3d.bev_pool` | `mmdet3d.ops.bev_pool.bev_pool.bev_pool` | 参考树 `mmdetection3d/mmdet3d/ops/bev_pool/bev_pool.py:96` 把尾部 `x.permute(0, 4, 1, 2, 3).contiguous()` 注释掉并 `return x`（5D）——**参考确实改了 bev_pool，但方式和通用 group 不是一回事**：它把 collapse Z 挪进了 `LSSTransform.down_sample`（见 §3.6.1），而通用 `mmdet3d.bev_pool` group 是在 Python 层重写整个函数。基线树 `:96` 仍是 `x = x.permute(...)` |
+| `mmdet3d.quick_cumsum` | `...bev_pool.bev_pool.QuickCumsum.forward/backward` | 两侧树的 CPU 版 `QuickCumsum` 都是原始写法：`kept[:-1] = ...`、`x[kept]`、`back[kept] -= 1`，未被侵入式改过 |
+| `mmdet3d.gaussian` | `mmdet3d.core.utils.gaussian.gaussian_2d` | `core/utils/gaussian.py`：纯 `np.ogrid`/`np.exp`/`h[h < eps] = 0`，`draw_heatmap_gaussian` 里再 `torch.from_numpy(...)` 搬回 GPU；两侧树一致 |
+| `mmdet3d.voxelization` | `...voxel.voxelize._Voxelization.forward` | `ops/voxel/voxelize.py`：调 `from .voxel_layer import dynamic_voxelize, hard_voxelize`——mmdet3d 自带、随源码编译的扩展；两侧树一致 |
+| `mmdet3d.canonical_indice_pairs` | `mmdet3d.ops.spconv.ops.get_indice_pairs` | `ops/spconv/ops.py`：调 `sparse_conv_ext.get_indice_pairs_2d/3d/4d`——mmdet3d 自带扩展，不是 `turbo_physai.ops` |
+| `mmdet3d.sparse_tensor` | `...structure.SparseConvTensor.sparity` | `ops/spconv/structure.py`：`return self.indices.shape[0] / np.prod(self.spatial_shape) / self.batch_size`，`np.prod` 写法，未替换成显式三维乘法 |
+| `mmcv.msda` | `mmcv._ext.ms_deform_attn_forward/backward` | `mmcv` 是 pip 安装依赖，不在仓库源码树内。参考树在调用侧做了替换（`lightop` fallback，见 K4），但没有对 `mmcv._ext` 做 monkeypatch |
+
+六个 `mmdet3d.*` 替换调用的都是 mmdet3d/mmdetection3d **自带的原生编译扩展**（`bev_pool_ext`、`voxel_layer`、`sparse_conv_ext`），不是 `turbo_physai.ops` 打包的版本。其中 `bev_pool` 是唯一一个参考实现真正动过源码的（改法见上表）；其余 5 个在两侧树里都是上游原样。
+
+这 7 个框架层 group 设计上不要求改动模型源码，能否生效完全取决于配置里对应 `enabled` 开关是否打开、monkeypatch 是否被触发。当前配置下它们不在 `optimization.yaml` 里，因此**一个都没生效**；要让它们生效，需要取消 `recipe.yaml:18-20` 的 `extends` 注释并重新生成配置。
+
+需要说明的是，baseline 源码里**没有**任何 `@torch.compile` 装饰器（19 个挂点全在参考树里），所以 `maptrv2.compile` 这类 group 不会被"源码里写死的装饰器"绕过——早先版本的本节文字有过这个推断，已在 §3.8 更正。
 
 #### 3.6.3 覆盖结论
 
 ```text
 参考实现 19 个 compile 挂点
-├── 10 个基线同名挂点       已声明；Group 默认关闭，mode 与参考不同
-├──  8 个新 helper 挂点    未接入；需要改模型源码或编译更大的外层方法
-└──  1 个 assigner 挂点    部分接入；当前仅做 dynamo.disable，静态打包未实现
+├── 10 个基线同名挂点       已接入（maptrv2.compile，enabled: true）；mode 与参考一致
+├──  8 个新 helper 挂点    已接入（maptrv2.reference_boundaries，见 B6）；enabled: true
+└──  1 个 assigner 挂点    已接入（maptrv2.assigner）；静态契约完整，但 assign 的
+                             torch.compile 由 TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE 控制，
+                             默认 "0"（不编译），且参考的 cudagraphs 选项未复刻
 
-MapTRv2 专属优化
-├── 已接入：training / data / grid_mask / match_cost / pv_mask / efficientnet / bev_pool_fix
-├── 部分接入：compile / assigner
-└── 未接入：8 个 helper、assigner 静态契约、bev_pool+down_sample 完整重构、
-             LineString 拷贝消除、CUDAExtension 强制构建、lightop 算子替换
+MapTRv2 专属优化（11 个 group 全部 enabled: true）
+├── training / data / grid_mask / match_cost / pv_mask / efficientnet  生效
+├── spconv_registry                                                  生效但当前冗余（wheel 已有 force=True）
+├── bev_pool_fix                                                     生效但被 reference_boundaries 旁路
+├── compile / reference_boundaries                                   生效
+├── assigner                                                         静态化生效，assign 编译不生效
+└── ddp_static_graph                                                 生效（需与 assigner 配对）
 
-mmdetection3d 与部署层
-├── 通用优化：通过 common.hcu.base 接入一部分
-└── 参考特有构建/契约改动：多数尚未迁移
+未接入的缺口
+├── 数据集向量化第二梯队（_interpolate_line_points_vectorized、shift_fixed_num_sampled_points_v2 缓存）
+├── GDK geometric_kernel_attn_cuda.cu 的 AT_DISPATCH value.scalar_type() 改动
+└── lightop 算子替换（需要 import 层切换，replace/wrap 够不到）
+
+mmdet3d 与部署层
+├── 框架层通用优化：extends 链当前断开，7 个 group 全部未生效
+└── 构建兼容补丁：build.py 已离线覆盖 mmcv_maximum_version / numba / ATen include /
+                 __CUDACC__ / c++17 / GDK setup.py "if 1:"，不含上面那条 .cu 改动
 ```
 
-因此当前不能表述为”权威优化版已经全部剥离并接入”。若目标是完全对齐参考实现，仍需补：
-8 个 compile 边界、assigner 全链路静态化、`bev_pool`/`down_sample` 完整重构（ROCm layout 修正已通过 `maptrv2.bev_pool_fix` 接入）、`CUDAExtension` 强制构建、lightop 算子替换，以及 mmdet3d 的 SparseConv 注册和构建兼容项。若只追求不修改
-模型源码的安全优化，则现有 `maptrv2.*` 七个默认开启 Group 可以作为第一阶段，但 compile
-与 assigner 只能算部分对齐。
+因此当前的说法应该是：**12 个 `maptrv2.*` group 全部已接入并处于启用状态，但其中两项
+（`spconv_registry`、`bev_pool_fix`）在当前运行时环境下分别表现为冗余和被旁路；
+真正的缺口集中在数据集向量化第二梯队和一条 GDK 内核补丁上。**
+7 个框架层 group 不是"接入了但没生效"，而是 `extends` 链根本没接线。
+
+开启 `maptrv2.compile` / `maptrv2.reference_boundaries` 之后，编译耗时/重编译次数/精度/吞吐
+的 A/B 仍然是必要步骤——默认 mode 与参考一致只说明配置对得上，不说明收益已在目标机型验证过。
 
 ### 3.7 未接入与部分接入项
 
-本节把尚未接入或只做了安全替代的优化集中列出。每项都按“优化前 -> 优化后、设计作用、未接入
-原因”说明。作用是参考实现的设计目标；截至目前没有对应的上机性能数据，不能视为已验证收益。
+本节把尚未接入、或虽然接入了但当前不产生效果的优化集中列出。每项都按“优化前 -> 优化后、
+设计作用、接入方式/未接入原因”说明。作用是参考实现的设计目标；截至目前没有对应的上机性能
+数据，不能视为已验证收益。
 
-当前状态分为三类：
+当前状态分为四类：
 
-- **部分接入**：`maptrv2.compile` 的 10 个同名目标、`maptrv2.assigner` 的安全降级。
-- **未接入**：7 个新增 Helper 挂点、`bev_pool`/`down_sample` 布局契约、扩展构建和
-  SparseConv 注册。
-- **已有等价替代**：`TransposeImage` 的输入布局处理。
+- **已接入并启用**：`maptrv2.compile` 的 10 个同名目标、`maptrv2.reference_boundaries` 的 8 个新增
+  Helper 挂点（见 B6）、`maptrv2.assigner` 的静态契约（U4）、`maptrv2.ddp_static_graph`（U7）。
+- **已接入但当前不生效**：`maptrv2.assigner` 内 `assign` 的 `torch.compile`（U4）、
+  `maptrv2.spconv_registry`（U8）、`maptrv2.bev_pool_fix` 的主路径（U3）。
+- **未接入**：数据集向量化第二梯队（U6）、GDK `.cu` 补丁（K3）。
+- **已有等价替代**：`TransposeImage` 的输入布局处理（L2）。
 
 #### 3.7.1 跨文件与源码改造
 
-**U1. 10 个同名 `compile` 挂点（部分接入）**
+**U1. 10 个同名 `compile` 挂点（已接入并启用）**
 
-优化前是普通 eager 函数，参考实现直接加：
+优化前是普通 eager 函数，参考实现给它们加了编译装饰器：
 
 ```python
 # 优化前：普通 Python 函数
 def hot_method(...):
     ...
 
-# 参考实现：交给 Inductor 编译
-@torch.compile()
+# 参考实现：
+@torch.compile(mode="max-autotune-no-cudagraphs")
 def hot_method(...):
     ...
 ```
 
-- 接入状态：10 个目标已经通过 `_COMPILE_TARGETS` 声明并注册到 `maptrv2.compile`。将 recipe
-  中的 `enabled: false` 改为 `true` 后，就会在这些目标上安装 `compile_wrapper`；如果目标环境没有可用编译能力或设置了禁用环境变量，`runtime_condition` 会自动回退原函数。
+- 接入状态：10 个目标通过 `_COMPILE_TARGETS` 声明并注册到 `maptrv2.compile`，配置中
+  `enabled: true`。引擎在这些目标上安装 `compile_wrapper`；如果目标环境没有可用编译能力或
+  设置了 `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1`，`runtime_condition` 会逐次调用回退原函数。
 
 - 作用：减少 Python/调度开销，并让 Inductor 融合相邻 elementwise 算子。
 
-- 默认未启用的原因：参考实现直接使用无参 `@torch.compile()`，当前实现使用
-  `max-autotune-no-cudagraphs`。开启前需要在目标机型确认编译耗时、重编译次数、精度和吞吐。
+- 与参考的差异：**没有差异**。参考实现 19 个挂点里有 18 个显式写了
+  `mode="max-autotune-no-cudagraphs"`（只有 `MapTRAssigner.assign` 例外，见 U4），
+  与本包 `compile.py:43` 的默认 mode 相同。早先版本的本节文字写成"参考用无参
+  `@torch.compile()`、本包用 `max-autotune-no-cudagraphs`"，把 mode 差异当成了默认关闭的
+  理由，这条已在 §3.8 更正。
 
-**U2. 7 个新增 Helper 挂点（未接入）**
+- 仍需 A/B 的原因：mode 对得上只说明配置等价，不说明收益在目标机型上已经验证过。开启后
+  要观察首次编译耗时、重编译次数、精度与吞吐。
 
-7 项的具体抽取内容和编译收益见 §B5.1；此处保留未接入原因及后续处理边界。
+**U2. 8 个新增 Helper 挂点（已接入并启用）**
+
+8 项的具体抽取内容、替换目标和编译收益见 §B6；此处保留接入方式与启用状态说明。
 
 参考实现把大函数中的局部逻辑抽成小函数，再单独编译：
 
@@ -1326,7 +1580,7 @@ def large_forward() {
 }
 
 # 参考实现：
-@torch.compile()
+@torch.compile(mode="max-autotune-no-cudagraphs")
 def helper(...):
     纯局部计算
 
@@ -1334,15 +1588,19 @@ def large_forward():
     整理 Python 侧输入 -> helper(...)
 ```
 
-`down_sample` 单列为 U3，这里的 7 处包括：
+8 处包括 `down_sample`（B6.3）在内共 8 个 helper：
 
-- `BaseTransform.matmul_1/2/3`：从 `get_geometry_v1` 拆出 view、矩阵乘、cat 和加减，缩小图边界并增加融合机会。
-- `BaseTransform.extract_metas`：把 `img_metas` 的 Python 循环和 numpy/device 转换集中处理，减少主计算路径上的 host 工作。
-- `MapTRPerceptionTransformer.initialize_queries_and_bev`：把 query/bev 的 split、expand、reference 计算和 permute 从 transformer `forward` 中拆出。
-- `MapTRv2Head.compute_decoder_predictions`：把逐 decoder level 的分类、回归和 list 拼接从 head `forward` 中拆出。
-- `MapTRv2Head.prepare_transformer_inputs`：把 query embedding、BEV query 和 attention mask 的配置态组装拆出。
+- `BaseTransform.matmul_1/2/3`（B6.1）：从 `get_geometry_v1` 拆出 view、矩阵乘、cat 和加减，缩小图边界并增加融合机会。
+- `BaseTransform.extract_metas`（B6.2）：把 `img_metas` 的 Python 循环和 numpy/device 转换集中处理，减少主计算路径上的 host 工作。
+- `LSSTransform.down_sample`（B6.3）：把分散在 `BaseTransform.bev_pool` 和 `LSSTransform.forward` 两处的 collapse-Z 与 downsample 合并成一个可编译 helper。
+- `MapTRPerceptionTransformer.initialize_queries_and_bev`（B6.4）：把 query/bev 的 split、expand、reference 计算和 permute 从 transformer `forward` 中拆出。
+- `MapTRv2Head.compute_decoder_predictions`、`prepare_transformer_inputs`（B6.5）：把逐 decoder level 的分类/回归/list 拼接，以及 query embedding、BEV query、attention mask 的配置态组装分别拆出。
 
-未接入原因：基线不存在这些新符号。`replace(target=...)` 要求目标符号已经存在，不能凭空插入Helper。若改为编译原来的大方法，又会把 Python 循环、list、numpy 交互和配置分支一起带入，导致多个 graph break，因此需要先修改模型源码重新切计算边界。
+**接入方式**：基线不存在这些新符号，`replace(target=...)` 无法把它们凭空声明成替换目标；`reference.py` 改为把 8 个 helper 实现为模块级纯函数，转而用 `wrap` 重写调用它们的 5 个基线原生方法（`maptrv2.reference_boundaries` group），让新实现内部调这些 helper，不新增模型源码符号（详见 §B6、§4.12）。
+
+**当前状态**：配置里 `enabled: true`，与参考实现同样使用 `max-autotune-no-cudagraphs`，并共用
+`_COMPILE_CONDITION`（`TURBO_PHYSAI_DISABLE_TORCH_COMPILE` 或环境无编译能力时逐次回退）。
+和 U1 一样，仍需要在目标机型确认编译耗时、重编译次数、精度和吞吐。
 
 **U3. `bev_pool` ROCm layout 修正（已接入）**
 
@@ -1373,8 +1631,16 @@ final = torch.cat(x.unbind(dim=2), 1)
 
 条件 `x.shape[-1] == self.C` 保证 CUDA 路径（`shape[-1] != self.C`）不会误触发，向前兼容。
 
-参考实现的「把 collapse Z 移入新 `down_sample` 并统一编译」优化属于跨函数布局契约重构，
-仍未接入（理由不变，见 §3.7.1/U3 原始说明）。
+`bev_pool_fix.py` 同时吸收了参考实现把 `torch.where(kept)[0]` + `index_select` 换成布尔掩码
+`x = x[kept]` / `geom_feats = geom_feats[kept]` 的改动（`bev_pool_fix.py:47-48`），
+所以它并不是"只加了一个 permute 判断"。
+
+**当前配置下的实际归属**：参考实现的「把 collapse Z 移入新 `down_sample` 并统一编译」优化
+由 `maptrv2.reference_boundaries` 的 `BaseTransform.forward` / `LSSTransform.forward` 包装承担
+（见 B6.3），而 `reference.py` 的 `base_transform_forward` 直接调 `_bev_pool_5d(self, features, geometry)`，
+**不再经过 `self.bev_pool`**。因此当两个 group 都开启（当前就是）时，本节的 `bev_pool_fix`
+在主训练路径上不会被调用——它是 `reference_boundaries` 关闭时的兜底，不是叠加生效的第二层。
+两者是同一段逻辑的两个实现，不要理解为互补。
 
 **启动方式**（须先设置 PYTHONPATH，再通过 TurboPhysAI 包裹启动）：
 
@@ -1393,7 +1659,7 @@ turbo-physai run \
 `maptrv2` model 支持）；`pip install -e` 在无卡构建环境因找不到 `torch` 而失败，因此用
 `PYTHONPATH` 替代。
 
-**U4. Assigner 静态化（部分接入）**
+**U4. Assigner 静态化（已接入；`assign` 的编译默认不开）**
 
 ```text
 优化前：
@@ -1412,10 +1678,25 @@ assign()  [@torch.compile]
 
 作用：固定 GT shape，减少 Dynamo guard 失效和重编译；把 CPU-only SciPy 求解隔离在图外。
 
-未接入原因：契约同时跨越 `loss`、`get_targets`、`_get_target_single`、`assign`、
-`sampler.sample` 和 `hungarian_match`。只替换 assigner 会直接 shape/语义不匹配。当前
-`maptrv2.assigner` 只对整个 `assign` 做 `torch._dynamo.disable`，是安全降级，不包含固定
-shape 和编译收益。
+**接入方式**：契约同时跨越 `loss`、`get_targets`、`_get_target_single`、`assign`、
+`sampler.sample` 和 `hungarian_match`，只替换 assigner 会直接 shape/语义不匹配，所以
+`maptrv2.assigner` 用 3 个 `replace` 目标一次性覆盖整条链：
+
+| 目标 | 包内实现（`assigner.py`） |
+| --- | --- |
+| `MapTRAssigner.assign` | `assign`（`:274`）→ `_assign_impl` / `_assign_no_grad` |
+| `MapTRv2Head.loss` | `static_loss`（`:457`）→ `_static_loss_impl`（`:331`），内部用 `pad_to_static_list` 把 GT 补到固定长度 |
+| `MapTRv2Head._get_target_single` | `get_target_single`（`:97`）+ `get_label_result`（`:47`） |
+
+`_hungarian_match_impl`（`:131`）包住 SciPy 的 `linear_sum_assignment`，通过
+`torch._dynamo.disable`（`:159-165`）把 CPU-only 求解隔离在图外——与参考实现的
+`hungarian_match` 做法一致。
+
+**与参考的差异**：参考对 `assign` 用的是
+`@torch.compile(options={"triton.cudagraphs": True, "triton.cudagraph_trees": False})`；
+本包由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制，**默认 `"0"` 即不编译**，开启时用的是
+`max-autotune-no-cudagraphs`，没有复刻那组 cudagraphs 选项。也就是说：静态化收益当前生效，
+`assign` 的编译收益当前不生效。
 
 **U5. DataLoader `spawn` 下 `dict_keys` pickle 崩溃（已接入）**
 
@@ -1473,13 +1754,120 @@ if num_workers > 0:
 `replace` 目标未变，仍是 `projects.mmdet3d_plugin.datasets.builder.build_dataloader`。回归测试
 见 `test/optimizations/test_maptrv2_data.py`（§3.4）。
 
-#### 3.7.2 Kernel、公共层与镜像
+**U6. 数据集向量化第二梯队（未接入）**
 
-**K1. 强制扩展构建（未接入）**
+`maptrv2.pv_mask` 覆盖的是 PV mask 相关的三个方法，但参考实现对
+`nuscenes_offlinemap_dataset.py` 的向量化改造还有另外两处，本包没有接：
 
 ```text
-优化前：torch.cuda.is_available() 为 False 时构建中止
-优化后：if 1，始终选择 CUDAExtension，并编译已有的 .cu 源
+优化前：逐点 shapely 插值（每个 instance 一次 Python 循环）
+优化后：
+  _interpolate_line_points_vectorized(line, distances)   # shapely 2.0 批量
+  LiDARInstanceLines.shift_fixed_num_sampled_points_v2
+      -> @cached_property，内部走 _shift_fixed_num_sampled_points_v2_vectorized
+         （批量插值 + unique_instance_ids/duplicate_meta 去重 + 预算 shift 索引矩阵）
+```
+
+| 参考实现位置（`/workspace/MapTRv2/.../nuscenes_offlinemap_dataset.py`） | 内容 | 本包 |
+| --- | --- | --- |
+| `:38-48` | `_interpolate_line_points_legacy` / `_interpolate_line_points_vectorized`，`:47` 按 shapely 版本二选一 | 无 |
+| `:184, :204, :258, :368, :379, :557, :566` | 7 个调用点从逐点循环换成向量化版本 | 无 |
+| `:347` | 原 `shift_fixed_num_sampled_points_v2` 降级为 `_shift_fixed_num_sampled_points_v2_legacy` | 无 |
+| `:406-532` | 新增 `_shift_fixed_num_sampled_points_v2_vectorized()` | 无 |
+| `:523` + `:129` | `shift_fixed_num_sampled_points_v2` 变成 `@cached_property`，并加缓存字段 | 无 |
+
+基线对应的只有 `nuscenes_offlinemap_dataset.py:321` 的原始循环实现。未接入原因：这两处的
+受益面在 dataloader worker 侧，`pv_mask.py` 目前只承载了 PV mask 的三条路径；要接入需要先
+确认目标环境的 shapely 版本（向量化分支依赖 shapely 2.0 的 `line_interpolate_point` /
+`get_coordinates`），再按同样方式增加 `replace` 目标。
+
+**U7. DDP 静态图（已接入）**
+
+```text
+优化前（基线 maptrv2_nusc_r50_24ep.py:337）
+    find_unused_parameters=True          # 每步遍历参数判断是否需要规约
+
+参考实现（:341-342）
+    find_unused_parameters=False
+    ddp_static_graph=True                # 交给 MMDistributedDataParallel 静态图优化
+bevformer/apis/mmdet_train.py:113,121,128  增加 ddp_static_graph 的读取与 static_graph 透传
+```
+
+作用：关掉 `find_unused_parameters` 的每步参数扫描，并按静态图假设做规约规划，
+减少 DDP 的反向通信开销。
+
+**为什么不能只改 config**：基线 `mmdet_train.py` 里**没有** `cfg.get('ddp_static_graph', ...)`
+这行，也没有 `static_graph=` 传参。只把字段塞进 `cfg` 会被静默忽略——参考实现是"config 字段 +
+训练 API 透传"两处同时改才成立的。
+
+**接入方式**：`maptrv2.ddp_static_graph` 用 `wrap` 挂在 DDP 构造点上，
+在构造时注入 kwargs，两端都不改源码：
+
+```python
+# catalog.py
+_DDP_API = "mmcv.parallel.distributed.MMDistributedDataParallel.__init__"
+DDP_STATIC_GRAPH = group(
+    "maptrv2.ddp_static_graph",
+    wrap(target=_DDP_API, replacement="...maptrv2_optimization.ddp.ddp_constructor_wrapper"),
+)
+
+# ddp.py
+def wrapped(self, *args, **kwargs):
+    kwargs.setdefault("static_graph", True)
+    kwargs["find_unused_parameters"] = False
+    return original(self, *args, **kwargs)
+```
+
+选择这个挂点有两层原因：
+
+| | 原因 |
+| --- | --- |
+| 为什么是 `MMDistributedDataParallel` | 基线 `mmdet_train.py:12` 是 `from mmcv.parallel import MMDistributedDataParallel`，类定义在 `mmcv/parallel/distributed.py:13`，且**没有重写 `__init__`**，直接继承 torch 的 |
+| 为什么这样安全 | 引擎的 `set_attribute` 是 `setattr(MMDistributedDataParallel, "__init__", wrapper)`，只在**子类上新建属性遮蔽继承**；`torch.nn.parallel.distributed.DistributedDataParallel.__init__` 不受影响（`test/optimizations/test_maptrv2_ddp.py` 里有断言） |
+
+一处挂点同时覆盖 `mmdet_train.py:75`（训练模型）和 `:81`（`eval_model`）两个构造点。
+
+**开关与默认值**（`ddp.py`，`options` > env > 默认值）：
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `TURBO_PHYSAI_DDP_STATIC_GRAPH` | `"1"` | 设 `0` 则不注入 `static_graph` |
+| `TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS` | `"1"` | 设 `0` 则保留基线 config 的 `find_unused_parameters`（当前 `True`） |
+
+默认值对齐参考实现（两个都生效），`runtime.yaml` 里显式写出。
+
+**前置条件**：`static_graph=True` 只在**第一轮迭代**推断"哪些参数不被使用"，之后一直沿用。
+若某参数首轮未被使用、之后被使用，其梯度**永远不会被规约**——静默的正确性错误。所以它必须与
+"计算图不随数据变化"配套，也就是必须和 `maptrv2.assigner`（`pad_to_static_list` 把 GT 固定到
+200）一起开。关闭 assigner 时应同步关闭本 group。
+
+已核实基线侧没有会让参数使用随数据变化的早退：`loss_single`（`maptrv2_head.py:621`）里
+cls/bbox/pts 三项损失无条件计算，`cls_avg_factor` 与 `num_total_pos` 都有 `max(..., 1)` /
+`clamp(min=1)` 兜底。
+
+torch 侧对 `static_graph=True` + `find_unused_parameters=True` 只发 warning 不报错，所以这里
+显式把 `find_unused_parameters` 也压成 `False`，与参考一致，同时避免日志噪声。
+
+**U8. `maptrv2.spconv_registry` 在当前环境是空操作（已接入但冗余）**
+
+`maptrv2.spconv_registry` 的目标是 `mmdet3d.ops.spconv.conv`，它解析到 **dist-packages 里安装的
+mmdet3d**，而这个 wheel 由 `/workspace/MapTRv2/mmdetection3d/dist/` 构建（见 §3.6.2 前提），
+其 `conv.py` 的 10 处 `@CONV_LAYERS.register_module(force=True)` 已经就位。因此该 group 在当前
+环境下不会改变任何注册行为。
+
+它并非无用：在"镜像预装了未打补丁的 mmdet3d"这类环境里，它正是让仓库自带的 SparseConv
+覆盖已注册项的开关。判断它是否生效，要看运行时 `import mmdet3d` 来自哪个构建。
+
+#### 3.7.2 Kernel、公共层与镜像
+
+**K1. 强制扩展构建（已接入，走离线构建补丁）**
+
+```python
+# 优化前：torch.cuda.is_available() 为 False 时构建中止
+if torch.cuda.is_available() and CUDA_HOME is not None:
+# 优化后：
+if 1:
+# if torch.cuda.is_available() and CUDA_HOME is not None:
 ```
 
 作用：绕过构建阶段的设备可用性判断，避免在无卡镜像构建环境中直接进入 `else`；ROCm
@@ -1488,10 +1876,16 @@ PyTorch 会按自身的扩展构建链处理该 CUDAExtension。
 需要澄清：权威版本没有新增 `.hip` 文件，仍只 glob `*.cu`。`if 1:` 也不会让纯 CPU 环境
 自动获得可运行算子，后续仍需要 CUDA/HIP 编译工具链。
 
-未接入原因：这是扩展构建逻辑，不是 Python 运行时函数，无法用 recipe 的 `target`/`replace`
-表达；要作为通用算子复用时，应先整理到 `TurboPhysAI/kernel/` 和 `operators/`。
+**接入方式**：`build.py:163 force_geometric_kernel_extension()` 对
+`projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/setup.py` 做同一个替换，
+由 `apply_build_compatibility()`（`build.py:186`）统一调度，通过
+`python -m turbo_physai.optimizations.models.maptrv2_optimization.build` 显式执行。
 
-**K2. SparseConv 注册覆盖（未接入）**
+**为什么不做成 group**：这是扩展构建逻辑，不是 Python 运行时函数，无法用 recipe 的
+`target`/`replace` 表达；它作用于构建阶段，与运行时 monkeypatch 生命周期不重叠，所以放在
+`build.py` 这个离线补丁工具里。
+
+**K2. SparseConv 注册覆盖（已接入；当前环境冗余）**
 
 ```python
 # 优化前
@@ -1503,11 +1897,22 @@ class SparseConv2d(...): ...
 class SparseConv2d(...): ...
 ```
 
-参考实现共修改 11 个 SparseConv 类型。作用是避免容器镜像同时加载多套 mmdet3d/spconv 时出现registry 冲突。
+参考实现共修改 11 个 SparseConv 类型。作用是避免容器镜像同时加载多套 mmdet3d/spconv 时出现
+registry 冲突。
 
-未接入原因：这是通用 `mmdet3d` 能力，不应写进 MapTRv2 专属 catalog；更适合在`common/mmdet3d` 中增加独立的 registry-override Group。
+**接入方式**：`maptrv2.spconv_registry` 以 `registry_override` 覆盖
+`mmdet3d.ops.spconv.conv` 的 10 个 `SparseConv*`/`SubMConv*` 名称，配置中 `enabled: true`。
 
-**K3. 构建兼容（未接入）**
+**当前环境下的实际效果：无**。运行时 `import mmdet3d` 解析到 dist-packages 的 0.17.2，
+而该 wheel 由参考树构建、`conv.py` 里 10 处已经是 `register_module(force=True)`
+（见 §3.8.1），所以这个 group 不会改变任何注册结果。它的价值在于镜像里预装的是**未打补丁**
+的 mmdet3d 时——那种环境下它是必需的。
+
+**归属说明**：它保护的是通用 `mmdet3d` 能力，却声明在 MapTRv2 专属 catalog 里。如果要迁到
+`common/mmdet3d` 层，前提是先把 `extends: common.hcu.base` 接通（§2.6）——在继承链断开的
+状态下，放进通用层不会被这个 recipe 继承到。
+
+**K3. 构建兼容（大部分已接入，一条缺口）**
 
 ```diff
 - 使用旧版 THC/THC.h
@@ -1522,8 +1927,32 @@ class SparseConv2d(...): ...
 
 作用：让扩展能在当前 PyTorch、ROCm/HCU 和 Python 环境上成功构建。
 
-未接入原因：这些是构建补丁，不是运行时优化。应由基础镜像或 TurboPhysAI 的 kernel/build
-资产维护，recipe 的 Python 替换无法处理 C++/CUDA 编译条件。
+**已由 `build.py` 离线覆盖的部分**（`_build_compatibility_patches()` `:57` /
+`_point_op_patches()` `:142`）：
+
+| 补丁 | `build.py` 位置 |
+| --- | --- |
+| `mmcv_maximum_version = '1.4.0'` → `'1.6.2'` | `:62-63` |
+| `numba.errors` → `numba.core.errors` | `:72-73` |
+| `#ifdef __CUDA_ARCH__` → `#ifdef __CUDACC__`（及两处版本判断） | `:109-111` |
+| point ops 补 `#include <ATen/cuda/CUDAContext.h>` | `:150-154` |
+| 放开 numba 版本锁定 | `:118` |
+| `-std=c++14` → `-std=c++17` | `:127` |
+| GDK `setup.py` 的 `if 1:` | `:163`（见 K1） |
+
+**缺口**：参考实现还改了 GDK 内核源码
+`projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/src/geometric_kernel_attn_cuda.cu:57,127`：
+
+```diff
+- AT_DISPATCH_FLOATING_TYPES(value.type(), "multiscale_kernel_attn_forward_cuda", ...)
++ AT_DISPATCH_FLOATING_TYPES(value.scalar_type(), "multiscale_kernel_attn_forward_cuda", ...)
+```
+
+`build.py` 里没有这条替换。它在已有 `.so` 的环境下不影响运行，只有在重新编译 GDK 扩展时
+才会暴露；属于"重建扩展时需要补上"的构建项，不是运行期缺口。
+
+**为什么不做成 group**：这些是构建补丁，不是运行时优化；recipe 的 Python 替换无法处理
+C++/CUDA 编译条件，所以统一由 `build.py` 这个离线工具承载。
 
 **K4. lightop DCU Deformable Attention 算子替换（未接入）**
 
@@ -1542,7 +1971,7 @@ except ImportError:
 
 #### 3.7.3 低收益项与替代方案
 
-**L1. LineString 拷贝消除（未接入，低收益）**
+**L1. LineString 拷贝消除（已接入，随 `maptrv2.pv_mask` 一起）**
 
 ```diff
 - vectors.append((LineString(np.array(instance)), label))
@@ -1551,8 +1980,10 @@ except ImportError:
 
 作用：省掉一次顶点数组分配和拷贝。
 
-未接入原因：优化很小，但所在 `gen_vectorized_samples` 约 90 行且控制流密集。为了避免为一次
-小拷贝整体替换该方法，当前未在 TurboPhysAI 单独实现。
+**接入状态**：`maptrv2.pv_mask` 的三个 `replace` 目标里包含 `gen_vectorized_samples`，
+`pv_mask.py` 中该函数已经是 `LineString(instance)`，所以这条改动已经随该 group 一起落地，
+不需要为它单独设 group（对照 §3.6.1 B11 一行）。它本身收益很小，价值在于消掉了每帧一次
+无用拷贝。
 
 **L2. TransposeImage（已有等价替代）**
 
@@ -1574,27 +2005,165 @@ class TransposeImage:
 **统一结论**
 
 ```text
-仅需启用与验证
-└── 10 个同名 compile 挂点
+已接入并生效
+├── 10 个同名 compile 挂点（maptrv2.compile）
+├── 8 个新增 Helper 挂点（maptrv2.reference_boundaries，见 B6）
+├── assigner 静态化（maptrv2.assigner；assign 的编译默认不开）
+├── DDP 静态图（maptrv2.ddp_static_graph，U7）
+├── CUDAExtension 强制构建（build.py，非 group）
+├── mmdet3d / point op 构建兼容补丁（build.py）
+├── SparseConv registry override（maptrv2.spconv_registry，当前环境冗余）
+└── LineString 单次拷贝消除（随 maptrv2.pv_mask）
 
-必须改模型源码或跨文件契约
-├── 7 个新增 Helper 挂点
-├── bev_pool + down_sample 完整重构（ROCm layout 修正已通过 bev_pool_fix 接入）
-└── assigner 完整静态化
+已接入但当前不生效
+├── maptrv2.assigner 内 assign 的 torch.compile（TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE 默认 0）
+├── maptrv2.bev_pool_fix 的主路径（被 reference_boundaries 旁路）
+└── 7 个框架层 group（extends 链未接线）
 
-应放到 Kernel、Common 或镜像层
-├── CUDAExtension 强制构建
-├── SparseConv registry override
-├── mmdet3d 构建兼容补丁
+未接入
+├── 数据集向量化第二梯队（U6）
+├── GDK geometric_kernel_attn_cuda.cu 的 scalar_type 改动（K3）
 └── lightop 算子替换（需封装到 turbo_physai/operators/）
 
 收益小或已有安全替代
-├── LineString 单次拷贝消除
-└── TransposeImage
+└── TransposeImage（L2）
 ```
 
-因此，当前最需要继续处理的是 7 个新增 Helper 挂点、`bev_pool`/`down_sample` 完整重构（ROCm layout 修正已接入，完整契约改造仍待完成）和 Assigner 完整静态化；随后是 lightop 算子替换、`CUDAExtension` 构建、SparseConv 注册和 mmdet3d 构建兼容。
-10 个同名 `compile` 挂点只需要在目标机型完成 A/B 后由配置启用，不需要再改接入代码。
+因此当前最需要继续处理的是 **U6 数据集向量化第二梯队**；
+`lightop` 算子替换需要先封装到 `turbo_physai/operators/` 才能进入配置管理；
+GDK 的 `.cu` 补丁只在重建扩展时需要；`spconv_registry` 与 `bev_pool_fix` 不是缺口，
+但在当前环境下分别是冗余和被旁路，启用配置时要知道它们没有叠加效果。
+
+10 个同名 `compile` 挂点、8 个新增 Helper 挂点和 `maptrv2.ddp_static_graph` 已经由配置启用，
+不需要再改接入代码，剩下的是在目标机型完成 A/B 观察。`ddp_static_graph` 上机时要注意两点：
+必须与 `maptrv2.assigner` 同时开启（U7 的前置条件），以及**验证方式是看 loss 曲线而不是看是否报错**
+——静态图接错的表现是某些参数静默不更新。
+
+### 3.8 三方差分审计
+
+§3.6/§3.7 的结论是在看不到本地参考源码、且配置状态与现在不同的条件下写的，本节用三份
+可直接打开的文件重新核对一遍，也是 §2.6、§3.6.2、U1、U2 那几处更正的依据。
+
+三条线：
+
+| 代号 | 路径 | 说明 |
+| --- | --- | --- |
+| **A** | `/workspace/model/MapTrv2` | 未优化基线，PhysAI 实际包裹的代码 |
+| **B** | `.../models/maptrv2_optimization` | 非侵入接入层（12 个 `maptrv2.*` group + `build.py`） |
+| **C** | `/workspace/MapTRv2` | 侵入式优化参考实现 |
+
+真实启动命令（`/workspace/run_maptrv2.sh:2,17-26`）：`cd /workspace/model/MapTrv2` 后
+`turbo-physai run --optimization-config .../maptrv2_optimization/configs/optimization.yaml
+--runtime-config .../maptrv2_optimization/configs/runtime.yaml --disable-numa
+torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT" _ ...`。
+`--disable-numa` 关掉 `runtime.yaml` 的 `process.numa`，NUMA 绑定改由脚本内联的
+`numactl --cpunodebind/--membind` 完成。
+
+#### 3.8.1 前提：运行时 mmdet3d 不是仓库树
+
+`import mmdet3d` 解析到 `/usr/local/lib/python3.10/dist-packages/mmdet3d`（0.17.2），
+其 `direct_url.json` 记录的是
+`file:///workspace/MapTRv2/mmdetection3d/dist/mmdet3d-0.17.2-...whl`——**wheel 由参考树 C 构建**。
+两侧自带树的状态对比证实了这一点：
+
+| | 安装版（实际运行） | A 自带树 | C 自带树 |
+| --- | --- | --- | --- |
+| `ops/bev_pool/bev_pool.py:96` | `#x = x.permute(0, 4, 1, 2, 3).contiguous()` | `x = x.permute(...)` | `#x = x.permute(...)` |
+| `ops/spconv/conv.py` 的 `force=True` 处数 | 10 | 0 | 10 |
+
+两个直接推论：
+
+1. A 与 C **共用同一个已被参考改动过的 mmdet3d**，所以"未优化基线"在 mmdet3d 这一层
+   并不干净——这正是 `maptrv2.bev_pool_fix` 在基线上必需的原因（`bev_pool` 已经不再自己
+   permute，调用方必须处理 `[B,Z,H,W,C]`）。
+2. `maptrv2.spconv_registry` 在当前环境是空操作（见 U8）。
+
+#### 3.8.2 Q1：有无未接入的优化项
+
+| 参考实现（C）的改动 | B 的接入情况 |
+| --- | --- |
+| 19 个 `@torch.compile` 挂点（18 个 `max-autotune-no-cudagraphs`） | 10 个走 `maptrv2.compile`，8 个 helper 走 `maptrv2.reference_boundaries`，第 19 个（`MapTRAssigner.assign`）在 `maptrv2.assigner` 内 |
+| `torch._dynamo.disable`（`hungarian_match`、`GridMask.forward`） | 均已接入（`assigner.py:159-165`、`grid_mask.py`） |
+| `set_float32_matmul_precision('high')`、`cudnn.benchmark`、`fork` | 均已接入（`maptrv2.training`） |
+| `cdist(p=1)` → 广播减法 | 已接入（`maptrv2.match_cost`） |
+| PV mask 向量化 + 合并 affine + `LineString` 拷贝消除 | 已接入（`maptrv2.pv_mask`） |
+| **数据集向量化第二梯队**（`_interpolate_line_points_vectorized`、`shift_fixed_num_sampled_points_v2` 缓存） | **未接入**（U6） |
+| DDP `ddp_static_graph=True` + `find_unused_parameters=False` | 已接入（`maptrv2.ddp_static_graph`，U7）；基线 `mmdet_train.py` 没有该字段，所以改在 DDP 构造点注入 |
+| **GDK `.cu` 的 `value.scalar_type()`** | **未接入**（K3） |
+| `bev_pool` 三文件协同改造（mmdet3d 去 permute / `bev_pool` return 5D / 编译版 `down_sample`） | 已接入（`maptrv2.reference_boundaries` + `maptrv2.bev_pool_fix`），但两者重叠，见 3.8.3 |
+| `SparseConv` / `EfficientNet` `force=True` | 已接入（`spconv_registry` / `efficientnet`） |
+| 构建补丁（`c++17`、`__CUDA_ARCH__`、`mmcv_maximum_version`、numba、ATen include、`if 1:`） | 已由 `build.py` 离线覆盖 |
+| `lightop` MSDeformAttn 后端切换 | 未接入；import 层决策，`replace`/`wrap` 够不到（K4） |
+| `ProfilerHook`、`test.py` DDP 兼容补丁、`map_ann_file` 硬编码、`evaluation interval=2→6` | 不属于模型优化包，不视为缺口 |
+
+#### 3.8.3 Q2：接入项是否正确接入
+
+| 项 | 结论 | 依据 |
+| --- | --- | --- |
+| 10 个同名 compile 挂点 | 正确 | 目标全部可解析；`compile.py:43` 默认 mode 与参考的 18 处一致。`LSSTransform.get_cam_feats` 在基线上已有 `@force_fp32()`，本包 wrap 的是装饰后的对象，等价于参考把 `@torch.compile` 叠在 `@force_fp32` 之上 |
+| 8 个 helper | 正确 | `reference_boundaries` 用 5 个 wrap 目标重建调用边界；`force_fp32` 只加在基线上本来就有 `@force_fp32` 的 3 处（`get_geometry_v1`/`BaseTransform.forward`/`head.forward`），`transformer.forward` 与 `LSSTransform.forward` 不加——与参考一致 |
+| `training` | 等价 | cudnn / matmul 两项与参考硬编码等价；channels-last 由"包 DDP 后转换"变为"转换后交给 `original`"，`Module.cuda()` 保留 memory_format |
+| `data` | 等价且更稳 | `pin_memory=True` 一致；额外加了 `multiprocessing_context`（参考没有），修掉 spawn 下 `dict_keys` 不可 pickle 的崩溃 |
+| `grid_mask` | 等价且更稳 | 用 `x.device` 替代参考硬编码的 `.cuda()` |
+| `match_cost` | 一致 | 与参考 `map_loss.py:527` 的广播减法同形 |
+| `pv_mask` | 部分覆盖 | 3 个目标与参考对应实现一致；数据集第二梯队未覆盖（Q1） |
+| `bev_pool_fix` | 正确但重叠 | 含参考的 `x[kept]` 布尔掩码替换 + ROCm layout 修正；**与 `reference_boundaries` 是同一段逻辑的两个实现** |
+| `assigner` | 正确 | `pad_to_static_list`/`hungarian_match`/`get_target_single` 均在包内实现；差异只在 `assign` 的编译选项 |
+| `spconv_registry` / `efficientnet` | 正确但前者冗余 | 见 U8 |
+
+**重叠的具体后果**：`reference.py:418-447` 的 `base_transform_forward` 直接调用
+`_bev_pool_5d(self, features, geometry)`，**不经过 `self.bev_pool`**。而 `bev_pool_fix` 的
+作用点正是 `BaseTransform.bev_pool`。两个 group 都开启时，主训练路径走的是
+`_bev_pool_5d`，`bev_pool_fix` 不会被调用。它不是"第二层保险"，而是 `reference_boundaries`
+关闭时的替代方案。
+
+#### 3.8.4 Q3：当前配置下是否都能生效
+
+配置事实（`configs/optimization.yaml` / `recipe.yaml` 核对）：
+
+- 12 个 `maptrv2.*` group **全部 `enabled: true`**，没有任何 `enabled: false`。
+- `recipe.yaml:18-20` 的 `extends: - common.hcu.base` **整段被注释**；`optimization.yaml`
+  无 `extends` 键，`optimization_modules` 只有 `maptrv2_optimization.catalog` 一行。
+- `runtime.yaml` 未设置 `TURBO_PHYSAI_DISABLE_TORCH_COMPILE` /
+  `TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC`，两者的运行时开关都在"允许"侧。
+
+| Group | 配置 | 实际生效 | 说明 |
+| --- | --- | --- | --- |
+| `training` / `data` / `grid_mask` / `match_cost` / `pv_mask` | enabled | 生效 | |
+| `efficientnet` | enabled | 生效 | |
+| `compile` | enabled，env 未禁 | 生效 | 与参考同 mode |
+| `reference_boundaries` | enabled，env 未禁 | 生效 | |
+| `ddp_static_graph` | enabled，env 默认 `"1"` | 生效 | 需与 `assigner` 配对，见 U7 |
+| `assigner` | enabled | 静态化生效，`assign` 编译**不生效** | `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 默认 `"0"` |
+| `spconv_registry` | enabled | **冗余空操作** | 运行时 wheel 已带 `force=True`（3.8.1） |
+| `bev_pool_fix` | enabled | **被旁路** | `reference_boundaries` 抢先接管 `BaseTransform.forward`（3.8.3） |
+| `mmcv.msda` + 6 个 `mmdet3d.*` | **不在配置里** | **不生效** | `extends` 链未接线（§2.6） |
+
+#### 3.8.5 结论
+
+```text
+A（未优化基线）
+  └── 自带 mmdet3d 树不被导入；运行时用的是 C 构建的 wheel
+        └── bev_pool 已 return 5D，所以 B 必须有 bev_pool_fix 才不崩
+
+B（PhysAI 接入层）
+  ├── 12 个 maptrv2.* group 全部 enabled: true
+  ├── 与 C 对齐的：19 个编译边界（10 + 8 + assigner）、精度/后端开关、
+  │   cdist 替换、PV mask 向量化、bev_pool 契约、注册表覆盖、构建补丁、
+  │   DDP 静态图
+  ├── 与 C 有差异的：assign 的编译选项（默认不开）
+  ├── 与 C 缺口：数据集向量化第二梯队、GDK .cu
+  └── 自身重叠/冗余：bev_pool_fix 被 reference_boundaries 旁路、
+      spconv_registry 在已打补丁的 wheel 上空转
+
+C（侵入式参考）
+  └── 另有 7 个框架层公共优化（mmcv.msda + 6 个 mmdet3d.*）
+        但 B 的 extends 链未接线，这 7 项当前一个都没进配置
+```
+
+一句话：**接入的项在语义上都对得上参考实现，主要缺口只剩数据集向量化第二梯队和 GDK 的 `.cu` 补丁；
+需要留意的是三项"接了但当前不产生效果"——`bev_pool_fix`（被旁路）、`spconv_registry`（冗余）、
+`assign` 的编译（默认关闭）——以及整条 `extends` 框架层继承链没有接线。**
 
 ---
 
@@ -2229,7 +2798,7 @@ if torch.version.cuda is not None or torch.version.hip is not None:
 ```
 
 **关于 HIP 源文件**：权威版本没有新增 `geometric_kernel_attn_cuda.hip` 或
-`geometric_kernel_attn_hip_kernel.cuh`，setup 仍只收集 `*.cu`。因此 B9 的准确描述是
+`geometric_kernel_attn_hip_kernel.cuh`，setup 仍只收集 `*.cu`。因此 B10 的准确描述是
 “强制扩展构建”，不是“新增 HIP kernel”。
 
 **边界**：`if 1:` 只绕过 Python 层的设备可用性判断，不会让纯 CPU 环境自动生成可运行算子。
@@ -2358,6 +2927,8 @@ affinity.scale(g, sx, sy, origin=(x0,y0)):
 
 ### 4.12 新增 `compile` 挂点无法直接替换的原因
 
+> **更正（已接入）**：本节分析的是"能不能用 `replace(target=...)` 直接命中这 8 个新符号"，结论是不能（原因见下）。但这不等于这 8 个挂点没法接入——`maptrv2.reference_boundaries` group（见 §B6）改用 `wrap` 包装调用这些 helper 的 5 个基线原生方法，绕开了本节说的限制，已经落地。本节内容作为"为什么直接 `replace` 走不通"的原因分析保留。
+
 §4.5 讲了"参考实现为什么把大方法拆成小函数再挂 `@torch.compile`"。这些挂点为什么不能用 recipe 的方式补进 TurboPhysAI？
 
 - **机制上不行：**PhysAI 的剥离手段是 `replace(target=...)`，要求基线里存在同名同签名的符号；这 8 个 helper（`matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions`、`prepare_transformer_inputs`）在基线里 grep 零命中，`optimization generate` 阶段就会报 target 不存在。
@@ -2444,9 +3015,10 @@ Dynamo 的编译单位是"连续可追踪的张量段"，遇到不可追踪的�
    - `TORCH_LOGS=graph_breaks,recompiles` 或 `torch._dynamo.explain(fn)(...)` → 图数量 / break 原因 / 重编译次数；
    - `TORCH_LOGS=inductor`（或 `tlparse`）→ 生成 kernel 数与融合情况；
    - profiler 对比该段 `self_cuda_time`，以及"冷启动 + 首次迭代"的额外耗时。
-4. 风险：本包 `compile_wrapper` 默认 `mode="max-autotune-no-cudagraphs"`，比参考实现的无参
-   `@torch.compile()` 更激进；对 `get_geometry_v1` 这种只有几个 kernel 的小段，autotune 的
-   投入产出比未必划算，建议先用默认 mode 对比。
+4. 风险：本包 `compile_wrapper` 默认 `mode="max-autotune-no-cudagraphs"`，与参考实现的
+   18 处挂点相同（参考唯一不同的是 `MapTRAssigner.assign` 的 cudagraphs 选项）；对
+   `get_geometry_v1` 这种只有几个 kernel 的小段，autotune 的投入产出比未必划算，
+   建议先用默认 mode 对比。
 
 **顺带更正**：`matmul_1/2/3` 的载体是 `BaseTransform.get_geometry_v1`（`encoder.py:90`），
 不是 `get_geometry:154` —— 后者走 `lidar2img` + `torch.linalg.solve`，在本配置里是**死代码**
@@ -2556,15 +3128,19 @@ assign_result, order_index = self.assigner.assign(bbox_pred, cls_score, pts_pred
 
 **本包的选择**
 
-`maptrv2.assigner` 只做 `torch._dynamo.disable(assign)`：把 scipy 段整段隔离在图外。这与参考
-实现的 `@torch._dynamo.disable hungarian_match` 是同一手法，只是基线没有 `hungarian_match`
-这个符号，只能在 `assign` 粒度上关；**不需要任何调用约定变更**，默认关闭、待 A/B。
+`maptrv2.assigner` 把 SciPy 段整段隔离在图外：基线没有 `hungarian_match` 这个符号，
+`assigner.py` 自己定义了 `_hungarian_match_impl`，再对它做 `torch._dynamo.disable`，
+与参考实现的 `@torch._dynamo.disable hungarian_match` 是同一手法。
 
-将来真要补静态打包，最小清单是：`replace` 覆盖 `MapTRv2Head.loss` / `loss_single` /
-`get_targets` / `_get_target_single` / `MapTRAssigner.assign` 共 5 个符号（`pad_to_static_list`
-是新增函数，挂不上，只能把逻辑塞进被替换的 `loss`），并确认 `maptr_head.py` 那个调用方
-（或明确声明只支持 MapTRv2 config）。顺序上建议先只上 dynamo 隔离，用 profiler 量 `assign`
-占比（含 break 造成的同步开销）；若占比很低，padding 改造不值得。
+**本文早先版本认为"无法安全表达完整静态契约、只能做 dynamo 隔离"，这一点已被实际实现推翻**：
+`maptrv2.assigner` 现在用 3 个 `replace` 目标（`assign` / `loss` / `_get_target_single`）覆盖了
+整条链，`pad_to_static_list` 的逻辑塞在被替换的 `loss` 内部而不是新增 head 方法，因此不需要
+改动调用约定。当前配置 `enabled: true`，详见 §3.7.1 U4。
+
+仍未复刻的是参考对 `assign` 的 `@torch.compile(options={"triton.cudagraphs": True, ...})`：
+本包由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制且默认不开，开启时用
+`max-autotune-no-cudagraphs`。若要评估收益，先用 profiler 量 `assign` 占比（含 graph break
+造成的同步开销）。
 
 ## 5. 优化点定位方法
 

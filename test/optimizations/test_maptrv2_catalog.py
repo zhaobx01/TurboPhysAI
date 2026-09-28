@@ -3,6 +3,7 @@
 
 """Structural tests for the MapTRv2 optimization catalog."""
 
+import ast
 import importlib
 import inspect
 import os
@@ -29,6 +30,7 @@ EXPECTED_GROUPS = {
     "maptrv2.spconv_registry": Mechanism.REGISTRY_OVERRIDE,
     "maptrv2.bev_pool_fix": Mechanism.REPLACE,
     "maptrv2.reference_boundaries": Mechanism.WRAPPER,
+    "maptrv2.ddp_static_graph": Mechanism.WRAPPER,
 }
 
 # Groups whose members must re-check an optional dependency on every call.
@@ -47,6 +49,72 @@ EXPECTED_CONDITIONS = {
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def _find_clean_map_checkout():
+    model_root = REPO_ROOT.parent / "model"
+    if not model_root.is_dir():
+        return None
+    return next(
+        (
+            path
+            for path in sorted(model_root.iterdir())
+            if path.is_dir() and path.name.lower() == "maptrv2"
+        ),
+        None,
+    )
+
+
+MODEL_ROOT = _find_clean_map_checkout()
+
+
+def _target_exists(repo_root, target):
+    parts = target.split(".")
+    search_root = (
+        repo_root / "mmdetection3d"
+        if parts[0] == "mmdet3d"
+        else repo_root
+    )
+    module_parts = None
+    for split in range(len(parts), 0, -1):
+        candidate = search_root.joinpath(*parts[:split]).with_suffix(".py")
+        if candidate.is_file():
+            module_parts = parts[:split]
+            break
+    if module_parts is None:
+        # Targets that do not live in the checkout (site-packages, e.g.
+        # ``mmcv.parallel.distributed.MMDistributedDataParallel.__init__``)
+        # are declared against what the interpreter imports instead.
+        from turbo_physai.engine.execution.replacements.base import (
+            HandlerError,
+            resolve_attribute,
+        )
+
+        try:
+            resolve_attribute(target)
+        except HandlerError:
+            return False
+        return True
+
+    module_path = search_root.joinpath(*module_parts).with_suffix(".py")
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    body = tree.body
+    for name in parts[len(module_parts):]:
+        node = next(
+            (
+                item
+                for item in body
+                if isinstance(
+                    item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+                and item.name == name
+            ),
+            None,
+        )
+        if node is None:
+            return False
+        body = node.body
+    return True
+
+
 class CatalogTest(unittest.TestCase):
     def test_catalog_can_be_imported(self):
         importlib.import_module("turbo_physai.optimizations.models.maptrv2_optimization.catalog")
@@ -55,9 +123,10 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(
             sorted(catalog.__all__),
             [
-                "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA", "EFFICIENTNET",
-                "GRID_MASK", "MATCH_COST", "PV_MASK",
-                "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "TRAINING",
+                "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
+                "DDP_STATIC_GRAPH", "EFFICIENTNET", "GRID_MASK", "MATCH_COST",
+                "PV_MASK", "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY",
+                "TRAINING",
             ],
         )
         for group_id in EXPECTED_GROUPS:
@@ -164,6 +233,24 @@ class CatalogTest(unittest.TestCase):
             "MapTRv2Head.forward",
             targets,
         )
+
+    @unittest.skipIf(
+        MODEL_ROOT is None, "sibling clean MapTRv2 checkout is unavailable"
+    )
+    def test_targets_resolve_in_clean_map_checkout(self):
+        targets = {
+            spec.target
+            for group_id in EXPECTED_GROUPS
+            for replacement_id in default_registry.get_group(group_id).members
+            for spec in (default_registry.get_spec(replacement_id),)
+            if spec is not None
+        }
+        for target in sorted(targets):
+            with self.subTest(target=target):
+                self.assertTrue(
+                    _target_exists(MODEL_ROOT, target),
+                    f"catalog target does not resolve: {target}",
+                )
 
     def test_optional_groups_dispatch_through_compat_probes(self):
         for group_id, (condition, member_count) in EXPECTED_CONDITIONS.items():

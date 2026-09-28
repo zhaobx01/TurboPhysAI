@@ -7,8 +7,9 @@
 参考基线：官方 `hustvl/MapTR` 仓库的 **`maptrv2` 分支**（HEAD `e03f097`）。
 所有 `target` 路径都按该分支的符号书写，可直接套在干净基线上。
 
-参考优化实现：**`autonomous-driving-models/hygon-hub/models/MapTRv2`**（权威，源码里 19 处
-`@torch.compile()` 挂点全部启用）。
+参考优化实现：**`/workspace/MapTRv2`**（权威，源码里 19 处 `@torch.compile` 挂点全部启用，
+其中 18 处为 `mode="max-autotune-no-cudagraphs"`）；未优化基线为 `/workspace/model/MapTrv2`。
+两条线的逐项差分见 `note.md` §3.8「三方差分审计」。
 
 ## 目录结构
 
@@ -20,6 +21,7 @@ maptrv2_optimization/
 │   ├── compat.py                # torch.compile / dynamo 能力探测
 │   ├── compile.py               # torch.compile / dynamo.disable 包装器
 │   ├── data.py                  # build_dataloader（pin_memory=True）
+│   ├── ddp.py                   # DDP 构造点的 static_graph 注入
 │   ├── grid_mask.py             # Dynamo 安全的 GridMask.forward
 │   ├── match_cost.py            # cdist(p=1) -> 广播减法
 │   ├── pv_mask.py               # PV/BEV 掩码绘制路径的向量化与变换合并
@@ -29,7 +31,7 @@ maptrv2_optimization/
 ```
 
 测试位于仓库级 `TurboPhysAI/test/optimizations/`，文件名为
-`test_maptrv2_catalog.py` 和 `test_maptrv2_implementations.py`。
+`test_maptrv2_catalog.py`、`test_maptrv2_ddp.py` 和 `test_maptrv2_implementations.py`。
 
 `configs/optimization.yaml` 不在仓库里：它必须由 `optimization generate` 在干净
 基线 worktree 上产出（`trust` 是 target 的源码/AST 哈希，手写必然过期）。
@@ -42,12 +44,18 @@ maptrv2_optimization/
 | `maptrv2.data` | `build_dataloader` 使用 `pin_memory=True`，Host→Device 拷贝可与计算重叠 | 开 | `TURBO_PHYSAI_PIN_MEMORY=0` 关闭 |
 | `maptrv2.grid_mask` | 保留官方掩码构造，只补 `np.copy()`（PIL 缓冲区只读）并把 `.cuda()` 换成 `x.device`；`forward` 常驻 `torch._dynamo.disable` | 开 | — |
 | `maptrv2.match_cost` | `OrderedPtsL1Cost` 用广播减法替换 `torch.cdist(p=1)`，避开 ROCm 覆盖不足的 kernel | 开 | — |
-| `maptrv2.pv_mask` | 辅助 PV 分割 GT 的 `line_ego_to_pvmask` 改为 numpy 弧长重采样，省掉每条线每路相机 200 次 shapely 调用；BEV 语义掩码的 `line_ego_to_mask` 把 `scale` + 平移两次 `shapely.affinity` 调用合并成一次 `scale_translate_geom`，并把 `np.array(list(coords))` 换成 `np.asarray`（逐像素一致） | 开 | `TURBO_PHYSAI_DISABLE_PV_MASK=1` 关闭 |
+| `maptrv2.pv_mask` | 辅助 PV 分割 GT 的 `line_ego_to_pvmask` 改为 numpy 弧长重采样，省掉每条线每路相机 200 次 shapely 调用；BEV 语义掩码的 `line_ego_to_mask` 把 `scale` + 平移两次 `shapely.affinity` 调用合并成一次 `scale_translate_geom`，并把 `np.array(list(coords))` 换成 `np.asarray`（逐像素一致）；第三个目标是 `gen_vectorized_samples`，顺带做掉参考实现去掉的 `LineString(np.array(instance))` 多余顶点拷贝 | 开 | `TURBO_PHYSAI_DISABLE_PV_MASK=1` 关闭 |
 | `maptrv2.efficientnet` | 允许 `EfficientNet` 覆盖 registry 中同名条目 | 开 | — |
-| `maptrv2.compile` | 给基线上携带编译挂点的 10 个热方法套 `torch.compile(mode="max-autotune-no-cudagraphs")`：`MapTRPerceptionTransformer.format_feats`、`MapTRDecoder.forward`、`MapTRv2.extract_img_feat`、`LSSTransform.get_cam_feats`/`get_mlp_input`、`maptrv2_head` 的 `normalize_3d_pts`、`normalize_2d_bbox`、`normalize_2d_pts`、`denormalize_2d_bbox`、`denormalize_2d_pts`；由 `compat.torch_compile_available` 逐次调用判定 | 关 | `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 关闭 |
-| `maptrv2.assigner` | 用 `torch._dynamo.disable` 把 SciPy Hungarian 求解隔离在图外，由 `compat.dynamo_available` 逐次调用判定 | 关 | — |
-`maptrv2.compile`、`maptrv2.assigner` 默认关闭，需要先在目标机型上完成精度/吞吐 A/B
-再打开。
+| `maptrv2.compile` | 给基线上携带编译挂点的 10 个热方法套 `torch.compile(mode="max-autotune-no-cudagraphs")`：`MapTRPerceptionTransformer.format_feats`、`MapTRDecoder.forward`、`MapTRv2.extract_img_feat`、`LSSTransform.get_cam_feats`/`get_mlp_input`、`maptrv2_head` 的 `normalize_3d_pts`、`normalize_2d_bbox`、`normalize_2d_pts`、`denormalize_2d_bbox`、`denormalize_2d_pts`；由 `compat.torch_compile_available` 逐次调用判定 | 开 | `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 关闭 |
+| `maptrv2.assigner` | 静态契约（`pad_to_static_list` / `get_target_single` / `get_label_result`）加 `torch._dynamo.disable` 隔离 SciPy Hungarian 求解；`assign` 自身的 `torch.compile` 另由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制，默认不开 | 开 | `TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC=1` 关闭静态化 |
+| `maptrv2.bev_pool_fix` | ROCm `bev_pool` 返回 `[B,Z,H,W,C]`，补一次 permute 回到 `[B,C,Z,H,W]`，并吸收参考实现的布尔掩码索引替换 | 开 | — |
+| `maptrv2.spconv_registry` | 允许仓库自带 SparseConv 覆盖 registry 中已注册条目；当前运行时 mmdet3d 已带 `force=True`，实际为空操作 | 开 | — |
+| `maptrv2.ddp_static_graph` | 在 `MMDistributedDataParallel` 的构造点注入 `static_graph=True` 与 `find_unused_parameters=False`。基线 `mmdet_train.py` 没有 `ddp_static_graph` 字段，所以不从 config 走，改为 wrap 该类的 `__init__`（只在 mmcv 子类上遮蔽继承，不动 Torch 的 DDP） | 开 | `TURBO_PHYSAI_DDP_STATIC_GRAPH=0`、`TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS=0` |
+
+`maptrv2.compile` 的 mode 与参考实现一致（参考 19 处挂点中 18 处用
+`max-autotune-no-cudagraphs`），但收益仍需在目标机型上完成精度/吞吐 A/B 后再确认。
+`maptrv2.bev_pool_fix` 与 `maptrv2.reference_boundaries` 是同一段 BEV layout 逻辑的两个实现，
+两者同时开启时后者接管主路径。
 
 ## 实现约定
 
@@ -123,44 +131,43 @@ turbo-physai run \
     矩阵（`scale_translate_geom`），并把 `np.array(list(line_ego.coords))` 换成
     `np.asarray(line_ego.coords)`。合成后的 xoff/yoff 与两步调用完全相同（推导见
     `note.md` §4.11），随机线段对拍 300/300 掩码逐像素相同。
-* **compile**：权威参考实现（`autonomous-driving-models/hygon-hub/models/MapTRv2`）
-  在源码里留下 19 处**已启用**的 `@torch.compile()` 挂点。其中 10 处落在基线同名符号
-  上（即 `_COMPILE_TARGETS` 列出的那些）；8 处挂在参考实现新抽出的 helper 上
-  （`BaseTransform.matmul_1/2/3`、`extract_metas`、`LSSTransform.down_sample`、
+* **compile**：权威参考实现（`/workspace/MapTRv2`）在源码里留下 19 处**已启用**的
+  `@torch.compile` 挂点，其中 18 处显式写了 `mode="max-autotune-no-cudagraphs"`
+  （只有 `MapTRAssigner.assign` 用 `options={"triton.cudagraphs": True, ...}`）。
+  10 处落在基线同名符号上（即 `_COMPILE_TARGETS` 列出的那些），由 `maptrv2.compile`
+  覆盖，默认 `mode` 与参考一致，可用 `options.mode` 覆盖；8 处挂在参考实现新抽出的
+  helper 上（`BaseTransform.matmul_1/2/3`、`extract_metas`、`LSSTransform.down_sample`、
   `initialize_queries_and_bev`、`compute_decoder_predictions`、
-  `prepare_transformer_inputs`），基线没有对应符号；第 19 处是 `MapTRAssigner.assign`，
-  由 `maptrv2.assigner` 单独处理。本包不改源码，只覆盖基线已有的 10 个热方法，默认
-  `mode` 为 `max-autotune-no-cudagraphs`（参考实现是无参 `@torch.compile()`，可用
-  `options.mode` 覆盖）。基线中这些 helper 的逻辑内联在
-  `MapTRPerceptionTransformer.forward`、`BaseTransform.get_geometry`/`forward`/
-  `bev_pool`、`LSSTransform.forward`、`MapTRv2Head.forward`，方法体大且含控制流，
-  本包有意不包裹，这几处仍走 eager。**注意**：参考实现的 `LSSTransform.down_sample`
-  挂点在基线里没有对应物——其逻辑分散在 `BaseTransform.bev_pool`（collapse Z）与
-  `LSSTransform.forward`（`self.downsample`），编译 `get_cam_feats` **覆盖不到**；
-  如需覆盖，把对应方法补进 `_COMPILE_TARGETS` 后重新 `generate`，并在 A/B 时先看
-  graph break 与重编译次数，再比较吞吐。
+  `prepare_transformer_inputs`），基线没有对应符号，由 `maptrv2.reference_boundaries`
+  包装 5 个原生调用方来重建这些编译边界（`note.md` §B6）；第 19 处是
+  `MapTRAssigner.assign`，由 `maptrv2.assigner` 单独处理，其编译默认关闭。
+  本包不改模型源码。A/B 时先看 graph break 与重编译次数，再比较吞吐。
 
 ## 不在本包范围内的参考实现改动
 
-* **`setup.py` 的 `if 1:` 强制构建**：权威参考实现只把编译条件从
+* **`setup.py` 的 `if 1:` 强制构建**：权威参考实现把编译条件从
   `torch.cuda.is_available() and CUDA_HOME is not None` 改成恒真，以便在无可见
   GPU 的构建环境中选择 `CUDAExtension`；它没有新增 HIP 源文件，源目录仍只有
-  `.cu` 文件，setup 也只 glob `*.cu`。这属于扩展构建层，不是运行时替换，因此本包
-  未声明对应 Group。
+  `.cu` 文件，setup 也只 glob `*.cu`。这属于扩展构建层，不是运行时替换，所以不由
+  Group 承载，改由 `build.py:163 force_geometric_kernel_extension()` 以离线补丁形式
+  覆盖。同一文件还覆盖了 `-std=c++17`、`#ifdef __CUDA_ARCH__`→`#ifdef __CUDACC__`、
+  `mmcv_maximum_version`、`numba.errors`、point op 的 ATen include 等构建补丁；
+  唯一未覆盖的是 GDK `.cu` 里 `AT_DISPATCH_FLOATING_TYPES(value.type(), …)` →
+  `value.scalar_type()`（重建扩展时需要手动补）。
 * **assigner 的静态打包改造**：见上文「与参考实现的差异说明」。
 * **`transform_3d.py` 的 `TransposeImage`**：参考实现在该文件里新增（且重复定义了
   两次）一个把图像转成 channels-last 的 pipeline，但基线与本参考实现的**任何
   config 都没有引用它**（`grep TransposeImage` 只命中定义处），属于未接线的实验
   代码，故本包不声明对应 Group。channels-last 由 `maptrv2.training` 在模型侧生效。
-* **`gen_vectorized_samples` 的 `LineString(np.array(instance))`**：权威参考实现去掉了
-  这次多余的数组拷贝（`LineString` 本来就接受顶点序列），它与已覆盖的 `line_ego_to_mask`
-  属于同一批 BEV 掩码路径改动。该方法约 90 行且控制流密集（`patch_box` 裁剪、多图层遍历、
-  可选的 shift/rotate 增强），为省一次拷贝而整体替换不划算，故本包只覆盖它的两个下游绘制
-  方法（见 `maptrv2.pv_mask`），此项不单独声明 Group。
-* **研究性质的 config 调参**：权威参考实现的 `maptrv2_nusc_r50_24ep.py` 相对基线只有四处：
-  `samples_per_gpu` 4→12、`workers_per_gpu` 4→48、`total_epochs` 24→1、
-  `log_config.interval` 50→1（`optimizer` 段没有任何改动）。这些属于用户 config 与调试
-  开关（见 `note.md` §3.1 的边界），不进本包。
+* **数据集向量化第二梯队**：参考实现还把 `nuscenes_offlinemap_dataset.py` 的
+  `_interpolate_line_points` 向量化（`:38-48`，7 个调用点）并把
+  `LiDARInstanceLines.shift_fixed_num_sampled_points_v2` 改成 `@cached_property`
+  （`:523`，旧实现降级为 `_shift_fixed_num_sampled_points_v2_legacy`），本包**未接入**。
+  它依赖 shapely 2.0 的 `line_interpolate_point` / `get_coordinates`，接入前需确认目标
+  环境版本。见 `note.md` §3.7.1 U6。
+* **研究性质的 config 调参**：参考实现的 `maptrv2_nusc_r50_24ep.py` 相对基线还有
+  `evaluation.interval` 2→6、`map_ann_file` 硬编码为绝对路径等改动。这些属于用户 config
+  与环境绑定项（见 `note.md` §3.1 的边界），不进本包。
 
 ## 与 `note.md` §2.2 草案的差异
 
@@ -171,8 +178,8 @@ turbo-physai run \
 | 草案写法 | 基线实际情况 | 本包做法 |
 | --- | --- | --- |
 | `tools.train.main`、`tools.train.__main__` | `tools/train.py` 是脚本，没有可替换的 `main` | 合并进 `maptrv2.training`，挂在 `custom_train_detector` 上 |
-| `LSSTransform.matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions` | 参考实现从大方法里抽出的新函数，基线里没有 | 改为包装基线已有的 10 个热方法（见 `maptrv2.compile` 一行）；`down_sample` 随 `get_cam_feats` 入图，其余新 helper 仍 eager |
-| `MapTRv2Head._get_target_single` + `assign()` 新签名 | 会改变 GT 调用约定，必须跨文件同步改 | 只保留 dynamo 隔离，见上文 assigner 说明 |
+| `LSSTransform.matmul_1/2/3`、`extract_metas`、`down_sample`、`initialize_queries_and_bev`、`compute_decoder_predictions` | 参考实现从大方法里抽出的新函数，基线里没有 | 由 `maptrv2.reference_boundaries` 包装 5 个原生调用方（`get_geometry_v1`/`BaseTransform.forward`/`LSSTransform.forward`/`transformer.forward`/`head.forward`）重建这些编译边界，见 `note.md` §B6 |
+| `MapTRv2Head._get_target_single` + `assign()` 新签名 | 会改变 GT 调用约定，必须跨文件同步改 | 由 `maptrv2.assigner` 的 3 个 `replace` 目标（`assign`/`loss`/`_get_target_single`）一次性覆盖整条链，见 `note.md` §3.7.1 U4 |
 | `EfficientNet` 的 `wrap` + `force_register` 替换 | 覆盖注册属于 registry 层能力 | 改用 `turbo_physai.compatibility.registry_override` |
 
 ## 静态核对现状
@@ -206,8 +213,15 @@ turbo-physai run \
   `:37`/`:49`/`:59`/`:68`，以及 `map_loss.py:510`（class 在 501）、
   `nuscenes_offlinemap_dataset.py:669`、`grid_mask.py:85`、`mmdet_train.py:28`、
   `datasets/builder.py:19`、`efficientnet.py:157`。
-* 上机后先跑「使用流程」的 1-3 步，再打开 `maptrv2.compile` / `maptrv2.assigner`
-  做精度与吞吐 A/B。
+* `maptrv2.ddp_static_graph` 的目标不在基线 checkout 内（`mmcv.parallel.distributed`），
+  它的证据哈希由 `optimization generate` 从已安装的 mmcv 采集，因此换 mmcv 版本后需要重新
+  `generate`。
+* 上机后先跑「使用流程」的 1-3 步。`maptrv2.compile` / `maptrv2.reference_boundaries` /
+  `maptrv2.assigner` / `maptrv2.ddp_static_graph` 在 `configs/optimization.yaml` 里已经是
+  `enabled: true`，所以 A/B 的做法是**反向关闭**它们（改成 `enabled: false` 重新 `generate`）
+  来取对照组；`assign` 自身的编译另需 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE=1`。
+  `ddp_static_graph` 必须与 `maptrv2.assigner` 同时开启，且验证要看 loss 曲线而不只是看是否
+  报错——静态图接错的表现是某些参数静默不更新（见 `note.md` §3.7.1 U7）。
 
 ## 注意事项
 

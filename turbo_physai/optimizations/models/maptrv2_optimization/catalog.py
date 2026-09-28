@@ -34,6 +34,9 @@ Group                                        Reference change
                                              override registry entries
 ``maptrv2.reference_boundaries``             eight extracted helper boundaries
                                              plus the reference BEV layout
+``maptrv2.ddp_static_graph``                 ``static_graph=True`` and
+                                             ``find_unused_parameters=False``
+                                             on ``MMDistributedDataParallel``
 ===========================================  ==================================
 
 ``maptrv2.training`` also pins the fp32 matmul precision to the reference's
@@ -57,6 +60,9 @@ _GRID_MASK_API = "projects.mmdet3d_plugin.models.utils.grid_mask.GridMask.forwar
 _ASSIGN_API = (
     "projects.mmdet3d_plugin.maptr.assigners.maptr_assigner.MapTRAssigner.assign"
 )
+# ``mmcv.parallel``'s subclass does not define ``__init__``; installing the
+# wrapper shadows the inherited Torch DDP constructor on the subclass only.
+_DDP_API = "mmcv.parallel.distributed.MMDistributedDataParallel.__init__"
 
 # ``torch.compile``/``torch._dynamo`` need a new enough Torch and the user's
 # consent, so the Groups that depend on them dispatch per call instead of
@@ -307,11 +313,23 @@ SPARSE_CONV_REGISTRY = group(
     ),
 )
 
+DDP_STATIC_GRAPH = group(
+    "maptrv2.ddp_static_graph",
+    wrap(
+        target=_DDP_API,
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization.ddp."
+            "ddp_constructor_wrapper"
+        ),
+    ),
+)
+
 __all__ = [
     "ASSIGNER",
     "BEV_POOL_FIX",
     "COMPILE",
     "DATA",
+    "DDP_STATIC_GRAPH",
     "EFFICIENTNET",
     "GRID_MASK",
     "MATCH_COST",

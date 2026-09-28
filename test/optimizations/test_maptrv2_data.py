@@ -124,6 +124,9 @@ def _build_loader_capture(maptrv2_data, monkeypatch):
     return captured
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="fork is unavailable on Windows"
+)
 def test_dataloader_defaults_to_fork_context(maptrv2_data, monkeypatch):
     monkeypatch.delenv("TURBO_PHYSAI_FORK_START_METHOD", raising=False)
     monkeypatch.delenv("TURBO_PHYSAI_DATALOADER_START_METHOD", raising=False)

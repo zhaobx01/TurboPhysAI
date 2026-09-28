@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib
 import random
 import sys
 import types
@@ -12,6 +13,9 @@ import pytest
 
 
 torch = pytest.importorskip("torch")
+
+
+MODULE = "turbo_physai.optimizations.models.bevformer.data"
 
 
 class _DataContainer:
@@ -24,7 +28,7 @@ class _DataContainer:
         self.pad_dims = pad_dims
 
 
-def _install_framework_stubs():
+def _install_framework_stubs(monkeypatch):
     """Expose only the public interfaces imported by the replacement module."""
 
     mmcv = types.ModuleType("mmcv")
@@ -61,31 +65,43 @@ def _install_framework_stubs():
         "mmdet.datasets.samplers": samplers,
     }
     for name, module in modules.items():
-        sys.modules.setdefault(name, module)
+        monkeypatch.setitem(sys.modules, name, module)
 
 
-_install_framework_stubs()
+@pytest.fixture
+def bevformer_data(monkeypatch):
+    """Import the replacement module under stubbed framework dependencies.
 
-from turbo_physai.optimizations.models.bevformer import data
+    The stubs are installed through ``monkeypatch`` so they disappear again on
+    teardown. Installing them at import time instead would leave a stub
+    ``mmcv`` in ``sys.modules`` for the rest of the session, hiding the real
+    package from every later test in the same pytest run.
+    """
+
+    _install_framework_stubs(monkeypatch)
+    monkeypatch.delitem(sys.modules, MODULE, raising=False)
+    module = importlib.import_module(MODULE)
+    yield module
+    monkeypatch.delitem(sys.modules, MODULE, raising=False)
 
 
-def test_worker_init_fn_sets_reproducible_numpy_and_python_seeds():
-    data.worker_init_fn(worker_id=2, num_workers=4, rank=3, seed=7)
+def test_worker_init_fn_sets_reproducible_numpy_and_python_seeds(bevformer_data):
+    bevformer_data.worker_init_fn(worker_id=2, num_workers=4, rank=3, seed=7)
     actual = (np.random.rand(), random.random())
     np.random.seed(21)
     random.seed(21)
     assert actual == pytest.approx((np.random.rand(), random.random()))
 
 
-def test_cuda_prefetch_metadata_group_discovery():
-    loader = object.__new__(data.CudaPrefetchLoader)
+def test_cuda_prefetch_metadata_group_discovery(bevformer_data):
+    loader = object.__new__(bevformer_data.CudaPrefetchLoader)
     first = {"lidar2img": [np.eye(4)], "img_shape": [(10, 10, 3)]}
     second = {"lidar2img": [np.eye(4)], "img_shape": [(10, 10, 3)]}
     assert loader._collect_meta_groups([[first], [second]]) == [[first, second]]
     assert loader._collect_meta_groups({"unrelated": [1, 2]}) == []
 
 
-def test_build_dataloader_non_distributed_contract(monkeypatch):
+def test_build_dataloader_non_distributed_contract(bevformer_data, monkeypatch):
     captured = {}
 
     class Loader:
@@ -110,10 +126,10 @@ def test_build_dataloader_non_distributed_contract(monkeypatch):
         "projects.mmdet3d_plugin.datasets.samplers.sampler": sampler,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(data, "DataLoader", Loader)
-    monkeypatch.setattr(data, "get_dist_info", lambda: (0, 1))
+    monkeypatch.setattr(bevformer_data, "DataLoader", Loader)
+    monkeypatch.setattr(bevformer_data, "get_dist_info", lambda: (0, 1))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    loader = data.build_dataloader(
+    loader = bevformer_data.build_dataloader(
         dataset,
         samples_per_gpu=2,
         workers_per_gpu=3,
@@ -130,3 +146,20 @@ def test_build_dataloader_non_distributed_contract(monkeypatch):
     assert captured["pin_memory"] is True
     assert captured["prefetch_factor"] == 16
     assert captured["persistent_workers"] is True
+
+
+def test_framework_stubs_do_not_outlive_the_fixture():
+    """No stub may still be sitting in ``sys.modules`` once this file finishes.
+
+    Must stay last in the file: it inspects the state left by the tests above.
+    A stub ``ModuleType`` has neither ``__path__`` nor ``__file__``, so one
+    left behind hides the installed package from every later test in the run.
+    """
+
+    for name in ("mmcv", "mmcv.parallel", "mmdet", "mmdet.datasets"):
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        assert hasattr(module, "__path__") or hasattr(module, "__file__"), (
+            f"a stub {name} leaked into sys.modules"
+        )

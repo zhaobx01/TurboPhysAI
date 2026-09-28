@@ -43,6 +43,12 @@ environment:
     TURBO_PHYSAI_DATALOADER_START_METHOD: fork
     TURBO_PHYSAI_PIN_MEMORY: "1"
     TURBO_PHYSAI_DISABLE_PV_MASK: "0"
+    # The reference implementation passes static_graph=True and
+    # find_unused_parameters=False to MMDistributedDataParallel. static_graph
+    # assumes a fixed autograd graph, so keep it paired with the assigner
+    # group; set either switch to "0" to fall back to the baseline behavior.
+    TURBO_PHYSAI_DDP_STATIC_GRAPH: "1"
+    TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS: "1"
   unset: []
 
 # The reference implementation ships tools/dist_train_numa.sh, so the recipe

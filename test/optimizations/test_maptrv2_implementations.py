@@ -31,6 +31,11 @@ try:
 except Exception:  # pragma: no cover - shapely ships with the model stack
     LineString = None
 
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - Pillow ships with the model stack
+    Image = None
+
 _GridMaskBase = torch.nn.Module if torch is not None else object
 class _GridMaskStub(_GridMaskBase):
     """Minimal stand-in for ``GridMask`` so the math can be tested alone."""
@@ -51,8 +56,8 @@ class _GridMaskStub(_GridMaskBase):
 
 
 def _official_mask(mask, use_h, use_w, mode, distance, start_h, start_w,
-                   keep, expanded_h, expanded_w):
-    """Official numpy mask construction (rotate == 1 is the identity)."""
+                   keep, expanded_h, expanded_w, rotate_draw):
+    """Official numpy/PIL mask construction."""
 
     if use_h:
         for index in range(expanded_h // distance):
@@ -62,6 +67,9 @@ def _official_mask(mask, use_h, use_w, mode, distance, start_h, start_w,
         for index in range(expanded_w // distance):
             start = distance * index + start_w
             mask[:, start:min(start + keep, expanded_w)] *= 0
+    mask = np.asarray(
+        Image.fromarray(np.uint8(mask)).rotate(rotate_draw)
+    )
     if mode == 1:
         mask = 1 - mask
     return mask
@@ -111,13 +119,19 @@ def _official_line_ego_to_mask(canvas_size, scale_x, scale_y, line_ego,
     return mask
 
 
-@unittest.skipIf(torch is None or mmcv is None,
-                 "torch and mmcv are required for GridMask tests")
+@unittest.skipIf(torch is None or mmcv is None or Image is None,
+                 "torch, mmcv and Pillow are required for GridMask tests")
 class GridMaskTest(unittest.TestCase):
-    def _run(self, module, stub, x, distance, start_h, start_w, prob_draw):
+    def _run(self, module, stub, x, distance, start_h, start_w, prob_draw,
+             rotate_draw):
         original_rand = np.random.rand
         original_randint = np.random.randint
-        draws = {"start": iter([start_h, start_w])}
+        randint_calls = iter((
+            ((2, x.size(2)), distance),
+            ((distance,), start_h),
+            ((distance,), start_w),
+            ((stub.rotate,), rotate_draw),
+        ))
 
         def fake_rand(*args):
             if args:
@@ -125,57 +139,80 @@ class GridMaskTest(unittest.TestCase):
             return prob_draw
 
         def fake_randint(*args):
-            if args == (2, x.size(2)):
-                return distance
-            if args == (stub.rotate,):
-                return 0
-            if args == (distance,):
-                return next(draws["start"])
-            raise AssertionError(f"unexpected randint args: {args}")
+            expected_args, value = next(randint_calls)
+            if args != expected_args:
+                raise AssertionError(
+                    f"unexpected randint args: {args}; "
+                    f"expected {expected_args}"
+                )
+            return value
 
         np.random.rand = fake_rand
         np.random.randint = fake_randint
+        runner = types.ModuleType("mmcv.runner")
+        runner.auto_fp16 = lambda *args, **kwargs: (
+            lambda function: function
+        )
         try:
-            return module.grid_mask_forward(stub, x)
+            with unittest.mock.patch.dict(
+                sys.modules, {"mmcv.runner": runner}
+            ):
+                with unittest.mock.patch.object(
+                    mmcv, "runner", runner, create=True
+                ):
+                    return module.grid_mask_forward(stub, x)
         finally:
             np.random.rand = original_rand
             np.random.randint = original_randint
 
-    def _expected(self, stub, x, distance, start_h, start_w):
+    def _expected(self, stub, x, distance, start_h, start_w, rotate_draw):
         _, _, height, width = x.shape
         expanded_h, expanded_w = int(1.5 * height), int(1.5 * width)
         keep = min(max(int(distance * stub.ratio + 0.5), 1), distance - 1)
         mask = np.ones((expanded_h, expanded_w), np.float32)
         mask = _official_mask(mask, stub.use_h, stub.use_w, stub.mode, distance,
-                              start_h, start_w, keep, expanded_h, expanded_w)
-        mask = mask[(expanded_h - height) // 2:(expanded_h - height) // 2 + height,
-                    (expanded_w - width) // 2:(expanded_w - width) // 2 + width]
-        return torch.from_numpy(mask)
+                              start_h, start_w, keep, expanded_h, expanded_w,
+                              rotate_draw)
+        mask = mask[
+            (expanded_h - height) // 2:
+            (expanded_h - height) // 2 + height,
+            (expanded_w - width) // 2:
+            (expanded_w - width) // 2 + width,
+        ]
+        return torch.from_numpy(np.asarray(mask).copy())
 
-    def test_mask_matches_official_numpy_construction(self):
+    def test_mask_matches_official_pil_construction(self):
         from turbo_physai.optimizations.models.maptrv2_optimization import grid_mask
 
-        stub = _GridMaskStub(True, True, rotate=1, offset=False, ratio=0.5,
-                             mode=1, prob=0.7)
-        x = torch.arange(2 * 3 * 32 * 40, dtype=torch.float32).reshape(
-            2, 3, 32, 40).contiguous()
-        expected_mask = self._expected(stub, x, distance=6, start_h=2,
-                                       start_w=4)
-        actual = self._run(grid_mask, stub, x, 6, 2, 4, prob_draw=0.0)
-        expected = x.view(-1, 32, 40) * expected_mask
-        torch.testing.assert_close(
-            actual.view(-1, 32, 40), expected, rtol=0, atol=0)
+        for rotate, rotate_draw in ((1, 0), (2, 0), (4, 1)):
+            with self.subTest(rotate=rotate, rotate_draw=rotate_draw):
+                stub = _GridMaskStub(
+                    True, True, rotate=rotate, offset=False, ratio=0.5,
+                    mode=1, prob=0.7)
+                x = torch.arange(
+                    2 * 3 * 32 * 40, dtype=torch.float32).reshape(
+                        2, 3, 32, 40).contiguous()
+                expected_mask = self._expected(
+                    stub, x, distance=6, start_h=2, start_w=4,
+                    rotate_draw=rotate_draw)
+                actual = self._run(
+                    grid_mask, stub, x, 6, 2, 4, prob_draw=0.0,
+                    rotate_draw=rotate_draw)
+                expected = x.view(-1, 32, 40) * expected_mask
+                torch.testing.assert_close(
+                    actual.view(-1, 32, 40), expected, rtol=0, atol=0)
 
     def test_offset_path_matches_official_numpy_construction(self):
         from turbo_physai.optimizations.models.maptrv2_optimization import grid_mask
 
-        stub = _GridMaskStub(True, True, rotate=1, offset=True, ratio=0.5,
+        stub = _GridMaskStub(True, True, rotate=4, offset=True, ratio=0.5,
                              mode=0, prob=0.7)
         x = torch.arange(1 * 2 * 16 * 24, dtype=torch.float32).reshape(
             1, 2, 16, 24).contiguous()
-        expected_mask = self._expected(stub, x, distance=4, start_h=1,
-                                       start_w=3)
-        actual = self._run(grid_mask, stub, x, 4, 1, 3, prob_draw=0.0)
+        expected_mask = self._expected(
+            stub, x, distance=4, start_h=1, start_w=3, rotate_draw=1)
+        actual = self._run(
+            grid_mask, stub, x, 4, 1, 3, prob_draw=0.0, rotate_draw=1)
         offset = torch.full((16, 24), 2 * (0.25 - 0.5), dtype=torch.float32)
         expected = (x.view(-1, 16, 24) * expected_mask
                     + offset * (1 - expected_mask))
@@ -187,7 +224,12 @@ class GridMaskTest(unittest.TestCase):
 
         stub = _GridMaskStub(True, True, prob=0.7)
         x = torch.ones(1, 1, 8, 8)
-        self.assertIs(self._run(grid_mask, stub, x, 3, 0, 0, prob_draw=0.9), x)
+        self.assertIs(
+            self._run(
+                grid_mask, stub, x, 3, 0, 0, prob_draw=0.9,
+                rotate_draw=0),
+            x,
+        )
 
     def test_eval_mode_returns_input(self):
         from turbo_physai.optimizations.models.maptrv2_optimization import grid_mask
@@ -195,7 +237,12 @@ class GridMaskTest(unittest.TestCase):
         stub = _GridMaskStub(True, True, prob=0.7)
         stub.training = False
         x = torch.ones(1, 1, 8, 8)
-        self.assertIs(grid_mask.grid_mask_forward(stub, x), x)
+        self.assertIs(
+            self._run(
+                grid_mask, stub, x, 3, 0, 0, prob_draw=0.0,
+                rotate_draw=0),
+            x,
+        )
 
 
 @unittest.skipIf(torch is None, "torch is required for implementation tests")
@@ -453,20 +500,34 @@ class PvMaskDrawingTest(unittest.TestCase):
                     np.asarray(one_step.coords), np.asarray(two_step.coords))
 
 
+def _import_bev_pool_fix():
+    mmdet3d = types.ModuleType("mmdet3d")
+    ops = types.ModuleType("mmdet3d.ops")
+    ops.bev_pool = lambda *args: None
+    mmdet3d.ops = ops
+    with unittest.mock.patch.dict(
+        sys.modules, {"mmdet3d": mmdet3d, "mmdet3d.ops": ops}
+    ):
+        from turbo_physai.optimizations.models.maptrv2_optimization import (
+            bev_pool_fix,
+        )
+    return bev_pool_fix
+
+
 @unittest.skipIf(torch is None, "torch is required for bev_pool_fix tests")
 class BevPoolFixTest(unittest.TestCase):
     """Verify that ``base_transform_bev_pool`` produces the correct output shape
-    for both CUDA layout ``[B, C, Z, H, W]`` and ROCm layout ``[B, Z, H, W, C]``
-    returned by the inner ``bev_pool`` call.
+    for both the legacy Python-wrapper layout ``[B, C, Z, H, W]`` and the
+    raw/optimized wrapper layout ``[B, Z, H, W, C]`` returned by ``_bev_pool``.
 
     The real ``mmdet3d.ops.bev_pool`` is replaced with a stub that returns a
     pre-built tensor of the desired layout so the test runs without HCU hardware
     or the model stack.
     """
 
-    # Grid dimensions matching a typical MapTRv2 config (nx=[200,100,1], C=256).
+    # Grid dimensions matching a typical MapTRv2 config (nx=[200,400,1], C=256).
     B, N, D, H_in, W_in, C = 2, 6, 1, 8, 8, 4
-    NX0, NX1, NX2 = 10, 10, 1  # nx[0], nx[1], nx[2] (x, y, z bins)
+    NX0, NX1, NX2 = 10, 20, 1  # nx[0], nx[1], nx[2] (x, y, z bins)
 
     def _make_self(self):
         """Minimal stub standing in for a ``BaseTransform`` instance."""
@@ -491,26 +552,26 @@ class BevPoolFixTest(unittest.TestCase):
         return geom_feats, x
 
     def _expected_output_shape(self):
-        # collapse Z: C * nx[2] channels, spatial H=nx[1], W=nx[0]
-        return (self.B, self.C * self.NX2, self.NX1, self.NX0)
+        # collapse Z: C * nx[2] channels, spatial H=nx[0], W=nx[1]
+        return (self.B, self.C * self.NX2, self.NX0, self.NX1)
 
     def _run_with_stub_layout(self, layout):
         """Patch ``_bev_pool`` inside ``bev_pool_fix`` to return *layout* and
         call ``base_transform_bev_pool``; return the output tensor."""
         import torch as _torch
-        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+        bev_pool_fix = _import_bev_pool_fix()
 
         self_stub = self._make_self()
         geom_feats, x = self._make_inputs()
 
         if layout == "NCHW":
-            # [B, C, Z, H, W] — what CUDA bev_pool returns
+            # [B, C, Z, H, W] - legacy Python wrapper layout.
             stub_out = _torch.zeros(
-                self.B, self.C, self.NX2, self.NX1, self.NX0)
+                self.B, self.C, self.NX2, self.NX0, self.NX1)
         elif layout == "NHWC":
-            # [B, Z, H, W, C] — what ROCm/HIP bev_pool returns
+            # [B, Z, H, W, C] - raw or optimized wrapper layout.
             stub_out = _torch.zeros(
-                self.B, self.NX2, self.NX1, self.NX0, self.C)
+                self.B, self.NX2, self.NX0, self.NX1, self.C)
         else:
             raise ValueError(layout)
 
@@ -519,11 +580,11 @@ class BevPoolFixTest(unittest.TestCase):
         ):
             return bev_pool_fix.base_transform_bev_pool(self_stub, geom_feats, x)
 
-    def test_cuda_layout_nchw_produces_correct_shape(self):
+    def test_legacy_nchw_layout_produces_correct_shape(self):
         out = self._run_with_stub_layout("NCHW")
         self.assertEqual(tuple(out.shape), self._expected_output_shape())
 
-    def test_rocm_layout_nhwc_produces_correct_shape(self):
+    def test_raw_nhwc_layout_produces_correct_shape(self):
         out = self._run_with_stub_layout("NHWC")
         self.assertEqual(tuple(out.shape), self._expected_output_shape())
 
@@ -531,7 +592,7 @@ class BevPoolFixTest(unittest.TestCase):
         """A zero-filled BEV grid collapses to zeros regardless of layout;
         verify the two paths agree element-wise for a non-trivial tensor."""
         import torch as _torch
-        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+        bev_pool_fix = _import_bev_pool_fix()
 
         self_stub = self._make_self()
         geom_feats, x = self._make_inputs()
@@ -539,7 +600,7 @@ class BevPoolFixTest(unittest.TestCase):
         base = _torch.arange(
             self.B * self.C * self.NX2 * self.NX1 * self.NX0,
             dtype=_torch.float32,
-        ).reshape(self.B, self.C, self.NX2, self.NX1, self.NX0)
+        ).reshape(self.B, self.C, self.NX2, self.NX0, self.NX1)
 
         nchw_out = None
         nhwc_out = None
@@ -561,20 +622,22 @@ class BevPoolFixTest(unittest.TestCase):
 
     def test_permute_guard_triggers_only_for_nhwc(self):
         """The permute guard must fire for NHWC (last dim == C) and stay silent
-        for NCHW (last dim == nx[0], not C when nx[0] != C)."""
+        for NCHW (last dim == nx[1], not C when nx[1] != C)."""
         import torch as _torch
-        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+        bev_pool_fix = _import_bev_pool_fix()
 
         self_stub = self._make_self()
         geom_feats, x = self._make_inputs()
 
-        nchw_stub = _torch.zeros(self.B, self.C, self.NX2, self.NX1, self.NX0)
-        nhwc_stub = _torch.zeros(self.B, self.NX2, self.NX1, self.NX0, self.C)
+        nchw_stub = _torch.zeros(
+            self.B, self.C, self.NX2, self.NX0, self.NX1)
+        nhwc_stub = _torch.zeros(
+            self.B, self.NX2, self.NX0, self.NX1, self.C)
 
-        # NCHW: last dim is NX0 (10), not C (4) — guard must not fire
-        self.assertNotEqual(self.NX0, self.C,
-                            "test requires NX0 != C to distinguish layouts")
-        self.assertEqual(nchw_stub.shape[-1], self.NX0)
+        # NCHW: last dim is NX1, not C - guard must not fire.
+        self.assertNotEqual(self.NX1, self.C,
+                            "test requires NX1 != C to distinguish layouts")
+        self.assertEqual(nchw_stub.shape[-1], self.NX1)
 
         # NHWC: last dim is C — guard fires and permutes to NCHW
         self.assertEqual(nhwc_stub.shape[-1], self.C)

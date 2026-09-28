@@ -3,13 +3,166 @@
 
 from __future__ import annotations
 
+import itertools
 import sys
 import types
 
+import numpy as np
 import pytest
 
 
 torch = pytest.importorskip("torch")
+
+
+def _reference_linear_sum_assignment(cost):
+    """Exhaustive optimum for the small matrices used by these tests."""
+
+    values = cost.tolist()
+    num_rows = len(values)
+    num_columns = len(values[0]) if num_rows else 0
+    if not num_rows or not num_columns:
+        return (
+            np.asarray([], dtype=np.int64),
+            np.asarray([], dtype=np.int64),
+        )
+
+    best = None
+    if num_rows <= num_columns:
+        for rows in itertools.permutations(range(num_rows)):
+            for columns in itertools.permutations(range(num_columns), num_rows):
+                score = sum(
+                    values[row][column]
+                    for row, column in zip(rows, columns)
+                )
+                if best is None or score < best[0]:
+                    best = (score, list(rows), list(columns))
+    else:
+        for columns in itertools.permutations(range(num_columns)):
+            for rows in itertools.permutations(range(num_rows), num_columns):
+                score = sum(
+                    values[row][column]
+                    for row, column in zip(rows, columns)
+                )
+                if best is None or score < best[0]:
+                    best = (score, list(rows), list(columns))
+    return (
+        np.asarray(best[1], dtype=np.int64),
+        np.asarray(best[2], dtype=np.int64),
+    )
+
+
+def _install_scipy_assignment_stub(monkeypatch):
+    scipy = types.ModuleType("scipy")
+    scipy.__path__ = []
+    optimize = types.ModuleType("scipy.optimize")
+    optimize.linear_sum_assignment = _reference_linear_sum_assignment
+    scipy.optimize = optimize
+    monkeypatch.setitem(sys.modules, "scipy", scipy)
+    monkeypatch.setitem(sys.modules, "scipy.optimize", optimize)
+
+
+def _install_padded_contract_stubs(monkeypatch):
+    project_names = (
+        "projects",
+        "projects.mmdet3d_plugin",
+        "projects.mmdet3d_plugin.maptr",
+        "projects.mmdet3d_plugin.maptr.dense_heads",
+        "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head",
+    )
+    project_modules = {
+        name: types.ModuleType(name) for name in project_names
+    }
+    for parent, child in zip(project_names, project_names[1:]):
+        setattr(
+            project_modules[parent],
+            child.rsplit(".", 1)[1],
+            project_modules[child],
+        )
+    head_module = project_modules[project_names[-1]]
+    head_module.normalize_2d_bbox = lambda value, _: value
+    head_module.normalize_2d_pts = lambda value, _: value
+    head_module.normalize_3d_pts = lambda value, _: value
+    head_module.denormalize_2d_bbox = lambda value, _: value
+
+    mmdet_names = (
+        "mmdet",
+        "mmdet.core",
+        "mmdet.core.bbox",
+        "mmdet.core.bbox.assigners",
+    )
+    mmdet_modules = {
+        name: types.ModuleType(name) for name in mmdet_names
+    }
+    for parent, child in zip(mmdet_names, mmdet_names[1:]):
+        setattr(
+            mmdet_modules[parent],
+            child.rsplit(".", 1)[1],
+            mmdet_modules[child],
+        )
+
+    class AssignResult:
+        def __init__(
+            self, num_gts, assigned_gt_inds, max_overlaps=None, labels=None
+        ):
+            self.num_gts = num_gts
+            self.assigned_gt_inds = assigned_gt_inds
+            self.max_overlaps = max_overlaps
+            self.labels = labels
+
+    def multi_apply(function, *args):
+        return tuple(
+            map(list, zip(*(function(*values) for values in zip(*args))))
+        )
+
+    mmdet_modules["mmdet.core"].multi_apply = multi_apply
+    mmdet_modules["mmdet.core.bbox.assigners"].AssignResult = AssignResult
+
+    for name, module in project_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    for name, module in mmdet_modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def _install_lidar_instance_lines_stub(monkeypatch):
+    module_names = (
+        "projects",
+        "projects.mmdet3d_plugin",
+        "projects.mmdet3d_plugin.datasets",
+        "projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset",
+    )
+    modules = {name: types.ModuleType(name) for name in module_names}
+    for parent, child in zip(module_names, module_names[1:]):
+        setattr(modules[parent], child.rsplit(".", 1)[1], modules[child])
+
+    class LiDARInstanceLines:
+        def __init__(
+            self,
+            instance_line_list,
+            instance_labels,
+            sample_dist=1,
+            num_samples=250,
+            padding=False,
+            fixed_num=-1,
+            padding_value=-10000,
+            patch_size=None,
+        ):
+            self.received = {
+                "instance_line_list": instance_line_list,
+                "instance_labels": instance_labels,
+                "sample_dist": sample_dist,
+                "num_samples": num_samples,
+                "padding": padding,
+                "fixed_num": fixed_num,
+                "padding_value": padding_value,
+                "patch_size": patch_size,
+            }
+            self.instances = instance_line_list
+            self.labels = instance_labels
+
+    modules[module_names[-1]].LiDARInstanceLines = LiDARInstanceLines
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return LiDARInstanceLines
 
 
 def test_pad_to_static_list_preserves_values_and_mask():
@@ -74,72 +227,222 @@ def test_static_target_path_uses_padded_gt_contract():
     )
 
 
-def test_assign_impl_consumes_padded_cost_mask(monkeypatch):
+@pytest.mark.parametrize("num_gts", (0, 1, 3, 6))
+def test_assign_impl_matches_unpadded_assignment(monkeypatch, num_gts):
     from turbo_physai.optimizations.models.maptrv2_optimization import assigner
 
-    module_names = (
-        "projects",
-        "projects.mmdet3d_plugin",
-        "projects.mmdet3d_plugin.maptr",
-        "projects.mmdet3d_plugin.maptr.dense_heads",
-        "projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head",
-    )
-    modules = {name: types.ModuleType(name) for name in module_names}
-    for parent, child in zip(module_names, module_names[1:]):
-        setattr(modules[parent], child.rsplit(".", 1)[1], modules[child])
-    module = modules[module_names[-1]]
-    module.normalize_2d_bbox = lambda value, _: value
-    module.normalize_2d_pts = lambda value, _: value
-    module.normalize_3d_pts = lambda value, _: value
-    module.denormalize_2d_bbox = lambda value, _: value
-    for name, value in modules.items():
-        monkeypatch.setitem(sys.modules, name, value)
+    _install_scipy_assignment_stub(monkeypatch)
+    _install_padded_contract_stubs(monkeypatch)
     monkeypatch.setattr(
-        assigner,
-        "_DISABLED_HUNGARIAN",
-        lambda cost, *args: (cost.shape, args[-1]),
+        assigner, "_get_hungarian_match",
+        lambda: assigner._hungarian_match_impl,
     )
+
+    num_queries = 4
+    num_points = 3
+    num_orders = 2
+    static_count = assigner.STATIC_GT_COUNT
+    generator = torch.Generator().manual_seed(17)
+    padded_bboxes = torch.full((static_count, 4), -1000.0)
+    padded_labels = torch.full((static_count,), -7, dtype=torch.long)
+    padded_points = torch.full(
+        (static_count, num_orders, num_points, 2), -1000.0
+    )
+    valid_mask = torch.zeros(static_count, dtype=torch.bool)
+    if num_gts:
+        padded_bboxes[:num_gts] = torch.rand(
+            num_gts, 4, generator=generator
+        )
+        padded_labels[:num_gts] = torch.randint(
+            0, 3, (num_gts,), generator=generator
+        )
+        padded_points[:num_gts] = torch.rand(
+            num_gts, num_orders, num_points, 2,
+            generator=generator,
+        )
+        valid_mask[:num_gts] = True
+
+    cls_cost = torch.full((num_queries, static_count), -1000.0)
+    pts_cost = torch.full(
+        (num_queries, static_count, num_orders), -1000.0
+    )
+    reg_cost = torch.rand(num_queries, 1, generator=generator)
+    iou_cost = torch.rand(num_queries, 1, generator=generator)
+    if num_gts:
+        cls_cost[:, :num_gts] = torch.rand(
+            num_queries, num_gts, generator=generator
+        )
+        pts_cost[:, :num_gts, :] = torch.rand(
+            num_queries, num_gts, num_orders,
+            generator=generator,
+        )
+
+    expected_order = pts_cost.argmin(dim=2)
+    total_cost = (
+        cls_cost + reg_cost + iou_cost + pts_cost.min(dim=2).values
+    )
+    expected_rows, expected_columns = (
+        _reference_linear_sum_assignment(
+            total_cost[:, valid_mask].numpy()
+        )
+    )
+    expected_inds = torch.zeros(num_queries, dtype=torch.long)
+    expected_labels = torch.full((num_queries,), -1, dtype=torch.long)
+    if expected_rows.size:
+        expected_rows_tensor = torch.as_tensor(expected_rows)
+        expected_columns_tensor = torch.as_tensor(expected_columns)
+        expected_inds[expected_rows_tensor] = expected_columns_tensor + 1
+        expected_labels[expected_rows_tensor] = padded_labels[
+            expected_columns_tensor
+        ]
 
     class Cost:
         weight = 1.0
 
         def __call__(self, left, right):
-            gt_count = (
-                right.shape[0]
-                if right.ndim == 1
-                else right.shape[0] * right.shape[1]
-            )
-            return torch.zeros(left.shape[0], gt_count)
+            del left, right
+            return cls_cost
 
     class ScalarCost:
         weight = 1.0
 
+        def __init__(self, value):
+            self.value = value
+
         def __call__(self, left, right):
-            del right
-            return torch.zeros(left.shape[0], 1)
+            del left, right
+            return self.value
+
+    class PointsCost:
+        weight = 1.0
+
+        def __call__(self, left, right):
+            del left, right
+            return pts_cost
+
+    model = types.SimpleNamespace(
+        cls_cost=Cost(),
+        reg_cost=ScalarCost(reg_cost),
+        iou_cost=ScalarCost(iou_cost),
+        pts_cost=PointsCost(),
+        z_cfg={"gt_z_flag": False},
+        pc_range=[0.0, 0.0, -1.0, 100.0, 100.0, 1.0],
+    )
+
+    assign_result, order_index = assigner._assign_impl(
+        model,
+        torch.zeros(num_queries, 4),
+        torch.zeros(num_queries, 3),
+        torch.zeros(num_queries, num_points, 2),
+        (padded_bboxes, valid_mask, num_gts),
+        (padded_labels, valid_mask, num_gts),
+        (padded_points, valid_mask, num_gts),
+    )
+
+    assert assign_result.num_gts == num_gts
+    torch.testing.assert_close(
+        assign_result.assigned_gt_inds, expected_inds
+    )
+    torch.testing.assert_close(assign_result.labels, expected_labels)
+    torch.testing.assert_close(
+        order_index[:, :num_gts], expected_order[:, :num_gts]
+    )
+
+
+def test_static_loss_uses_padded_contract(monkeypatch):
+    from turbo_physai.optimizations.models.maptrv2_optimization import assigner
+
+    _install_padded_contract_stubs(monkeypatch)
+    calls = []
 
     class Model:
-        cls_cost = Cost()
-        reg_cost = ScalarCost()
-        iou_cost = ScalarCost()
-        pts_cost = Cost()
-        z_cfg = {"gt_z_flag": False}
-        pc_range = [0.0, 0.0, -1.0, 100.0, 100.0, 1.0]
+        gt_shift_pts_pattern = "v0"
+        aux_seg = {"use_aux_seg": False}
 
-    _, order_index = assigner._assign_impl(
-        Model(),
-        torch.zeros(2, 4),
-        torch.zeros(2, 3),
-        torch.zeros(2, 1, 2),
-        (
-            torch.zeros(3, 4),
-            torch.tensor([True, True, False]),
-            2,
-        ),
-        (torch.zeros(3, dtype=torch.long), torch.tensor([True] * 3), 3),
-        (torch.zeros(3, 1, 2, 2), torch.tensor([True] * 3), 3),
+        @staticmethod
+        def loss_single(
+            cls_scores,
+            bbox_preds,
+            pts_preds,
+            gt_bboxes,
+            gt_labels,
+            gt_points,
+            gt_bboxes_ignore,
+        ):
+            calls.append(
+                {
+                    "cls_scores": cls_scores,
+                    "bbox_preds": bbox_preds,
+                    "pts_preds": pts_preds,
+                    "gt_bboxes": gt_bboxes,
+                    "gt_labels": gt_labels,
+                    "gt_points": gt_points,
+                    "gt_bboxes_ignore": gt_bboxes_ignore,
+                }
+            )
+            base = len(calls) * 10
+            return tuple(
+                torch.tensor(float(base + index)) for index in range(5)
+            )
+
+    gt_bboxes = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]
     )
-    assert order_index.shape == (2, 3)
+    gt_points = torch.arange(
+        2 * 2 * 3 * 2, dtype=torch.float32
+    ).reshape(2, 2, 3, 2)
+    gt_vecs = [
+        types.SimpleNamespace(
+            bbox=gt_bboxes,
+            shift_fixed_num_sampled_points=gt_points,
+        )
+    ]
+    gt_labels = [torch.tensor([0, 1])]
+    preds_dicts = {
+        "all_cls_scores": [torch.zeros(1, 4, 3), torch.ones(1, 4, 3)],
+        "all_bbox_preds": [torch.zeros(1, 4, 4), torch.ones(1, 4, 4)],
+        "all_pts_preds": [
+            torch.zeros(1, 4, 3, 2),
+            torch.ones(1, 4, 3, 2),
+        ],
+        "enc_cls_scores": torch.zeros(1, 4, 3),
+        "enc_bbox_preds": torch.zeros(1, 4, 4),
+        "enc_pts_preds": torch.zeros(1, 4, 3, 2),
+        "seg": None,
+        "pv_seg": None,
+    }
+
+    loss_dict = assigner._static_loss_impl(
+        Model(),
+        gt_vecs,
+        gt_labels,
+        None,
+        None,
+        preds_dicts,
+    )
+
+    assert len(calls) == 3
+    for call in calls:
+        padded_bboxes, bbox_mask, bbox_length = call["gt_bboxes"][0]
+        padded_labels, label_mask, label_length = call["gt_labels"][0]
+        padded_points, point_mask, point_length = call["gt_points"][0]
+        assert padded_bboxes.shape == (assigner.STATIC_GT_COUNT, 4)
+        assert padded_labels.shape == (assigner.STATIC_GT_COUNT,)
+        assert padded_points.shape == (
+            assigner.STATIC_GT_COUNT, 2, 3, 2
+        )
+        assert torch.equal(bbox_mask, label_mask)
+        assert torch.equal(bbox_mask, point_mask)
+        assert (bbox_length, label_length, point_length) == (2, 2, 2)
+        assert bbox_mask[:2].all()
+        assert not bbox_mask[2:].any()
+        assert call["gt_bboxes_ignore"] is None
+
+    torch.testing.assert_close(calls[0]["gt_bboxes"][0][0][:2], gt_bboxes)
+    torch.testing.assert_close(calls[0]["gt_points"][0][0][:2], gt_points)
+    assert torch.count_nonzero(calls[2]["gt_labels"][0][0]) == 0
+    assert loss_dict["loss_cls"].item() == 20.0
+    assert loss_dict["enc_loss_cls"].item() == 30.0
 
 
 def test_assigner_is_eager_by_default(monkeypatch):
@@ -255,25 +558,7 @@ def test_vectorized_samples_accepts_vertex_sequences(monkeypatch):
 
     from turbo_physai.optimizations.models.maptrv2_optimization import pv_mask
 
-    module_names = (
-        "projects",
-        "projects.mmdet3d_plugin",
-        "projects.mmdet3d_plugin.datasets",
-        "projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset",
-    )
-    modules = {name: types.ModuleType(name) for name in module_names}
-    for parent, child in zip(module_names, module_names[1:]):
-        setattr(modules[parent], child.rsplit(".", 1)[1], modules[child])
-
-    class LiDARInstanceLines:
-        def __init__(self, instances, labels, *args, **kwargs):
-            del args, kwargs
-            self.instances = instances
-            self.labels = labels
-
-    modules[module_names[-1]].LiDARInstanceLines = LiDARInstanceLines
-    for name, value in modules.items():
-        monkeypatch.setitem(sys.modules, name, value)
+    _install_lidar_instance_lines_stub(monkeypatch)
 
     model = types.SimpleNamespace(
         vec_classes=("boundary",),
@@ -291,6 +576,77 @@ def test_vectorized_samples_accepts_vertex_sequences(monkeypatch):
     )
     assert result["gt_vecs_label"] == [1]
     assert len(result["gt_vecs_pts_loc"].instances) == 1
+    received = result["gt_vecs_pts_loc"].received
+    assert (
+        received["instance_line_list"]
+        is result["gt_vecs_pts_loc"].instances
+    )
+    assert received["instance_labels"] == [1]
+    assert received["sample_dist"] == 1
+    assert received["num_samples"] == 20
+    assert received["padding"] is False
+    assert received["fixed_num"] == -1
+    assert received["padding_value"] == -10000
+    assert received["patch_size"] == (100, 100)
+
+
+def test_vectorized_samples_aux_seg_call_contract(monkeypatch):
+    pytest.importorskip("shapely")
+
+    from turbo_physai.optimizations.models.maptrv2_optimization import pv_mask
+
+    _install_lidar_instance_lines_stub(monkeypatch)
+    bev_calls = []
+    pv_calls = []
+    model = types.SimpleNamespace(
+        vec_classes=("boundary",),
+        CLASS2LABEL={"boundary": 1},
+        aux_seg={
+            "use_aux_seg": True,
+            "seg_classes": 1,
+            "bev_seg": True,
+            "pv_seg": True,
+            "pv_thickness": 2,
+        },
+        canvas_size=(100, 100),
+        thickness=3,
+        sample_dist=1,
+        num_samples=20,
+        padding=False,
+        fixed_num=-1,
+        padding_value=-10000,
+        patch_size=(100, 100),
+    )
+    model.line_ego_to_mask = lambda *args, **kwargs: bev_calls.append(
+        (args, kwargs)
+    )
+    model.line_ego_to_pvmask = lambda *args, **kwargs: pv_calls.append(
+        (args, kwargs)
+    )
+    example = {
+        "img_metas": types.SimpleNamespace(
+            data={
+                "pad_shape": [(64, 64), (64, 64)],
+                "lidar2img": [
+                    torch.eye(4).numpy(),
+                    torch.eye(4).numpy(),
+                ],
+            }
+        )
+    }
+
+    result = pv_mask.gen_vectorized_samples(
+        model,
+        {"boundary": [[(0.0, 0.0), (1.0, 1.0)]]},
+        example=example,
+    )
+
+    assert len(bev_calls) == 1
+    assert len(pv_calls) == 2
+    assert bev_calls[0][1] == {"color": 1, "thickness": 3}
+    assert all(call[1]["thickness"] == 2 for call in pv_calls)
+    assert tuple(result["gt_semantic_mask"].shape) == (1, 100, 100)
+    assert tuple(result["gt_pv_semantic_mask"].shape) == (2, 1, 2, 2)
 
 
 def test_force_geometric_kernel_extension_is_idempotent(tmp_path):
@@ -316,3 +672,33 @@ def test_force_geometric_kernel_extension_is_idempotent(tmp_path):
     text = setup_path.read_text(encoding="utf-8")
     assert text.startswith("    if 1:\n")
     assert "# if torch.cuda.is_available()" in text
+
+
+def test_bev_pool_compatibility_patch_is_explicit_and_idempotent(tmp_path):
+    from turbo_physai.optimizations.models.maptrv2_optimization import build
+
+    bev_pool_path = (
+        tmp_path
+        / "mmdetection3d"
+        / "mmdet3d"
+        / "ops"
+        / "bev_pool"
+        / "bev_pool.py"
+    )
+    replacements = dict(
+        build._build_compatibility_patches(tmp_path)
+    )[bev_pool_path]
+    bev_pool_path.parent.mkdir(parents=True)
+    bev_pool_path.write_text(
+        "def bev_pool(feats, coords, B, D, H, W):\n"
+        "    x = pool(feats, coords, B, D, H, W)\n"
+        "    x = x.permute(0, 4, 1, 2, 3).contiguous()\n"
+        "    return x\n",
+        encoding="utf-8",
+    )
+
+    assert build._replace_once(bev_pool_path, replacements) is True
+    assert build._replace_once(bev_pool_path, replacements) is False
+    text = bev_pool_path.read_text(encoding="utf-8")
+    assert "    #x = x.permute(0, 4, 1, 2, 3).contiguous()" in text
+    assert "\n    x = x.permute(0, 4, 1, 2, 3).contiguous()" not in text
