@@ -15,9 +15,13 @@ model:
 optimization_modules:
   - turbo_physai.optimizations.models.maptrv2_optimization.catalog
 
-# extends:
-#   # 继承自 common.hcu.base 配置，包含了基础的优化配置和通用设置
-#   - common.hcu.base
+# The reference implementation swaps MSDeformAttn's ``ext_module`` for LightOp.
+# ``framework.mmcv.hcu`` carries exactly that one Group (``mmcv.msda``) plus the
+# module that declares it; it is deliberately not ``common.hcu.base``, which
+# would also pull in the six ``mmdet3d.*`` Groups that have no counterpart in
+# the MapTRv2 reference.
+extends:
+  - framework.mmcv.hcu
 
 compatibility: {}
 
@@ -28,6 +32,9 @@ optimization_groups:
   # DataLoader pin_memory=True.
   - id: maptrv2.data
     enabled: true
+  # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
+  - id: maptrv2.bev_pool_fix
+    enabled: true    
   # Dynamo-safe GridMask.
   - id: maptrv2.grid_mask
     enabled: true
@@ -37,14 +44,15 @@ optimization_groups:
   # Vectorized PV-mask resampling plus the merged BEV-mask affine transform.
   - id: maptrv2.pv_mask
     enabled: true
+  # Arc-length resampling for shift_fixed_num_sampled_points_v2 (the pattern
+  # selected by gt_shift_pts_pattern='v2').
+  - id: maptrv2.dataset_vectorization
+    enabled: true
   # EfficientNet may override an already registered backbone entry.
   - id: maptrv2.efficientnet
     enabled: true
   # The vendored mmdet3d SparseConv classes may be pre-registered by an image.
   - id: maptrv2.spconv_registry
-    enabled: true
-  # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
-  - id: maptrv2.bev_pool_fix
     enabled: true
   # torch.compile on the extracted pure-tensor hot methods. Enable after the
   # accuracy/throughput A/B on the target machine.
@@ -60,4 +68,8 @@ optimization_groups:
   # Keep this paired with maptrv2.assigner: the static graph assumes a fixed
   # autograd graph, which pad_to_static_list provides.
   - id: maptrv2.ddp_static_graph
+    enabled: true
+  # Inherited from framework.mmcv.hcu; overridden here so the whole recipe can
+  # be switched off in one place.
+  - id: mmcv.msda
     enabled: true

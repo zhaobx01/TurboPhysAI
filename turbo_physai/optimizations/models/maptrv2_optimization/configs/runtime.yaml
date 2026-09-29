@@ -11,11 +11,11 @@ environment:
   set:
     # MIOpen / rocBLAS settings used by the MapTRv2 launch recipe.
     PYTORCH_MIOPEN_SUGGEST_NHWC: "1"
-    MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32: "1"
+    # MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32: "1"
     # MIOpen counterpart of torch.backends.cudnn.benchmark: exhaustively
     # search for the fastest convolution solver once and cache it.
-    MIOPEN_FIND_MODE: "1"
-    ROCBLAS_MATH_MODE: "1"
+    # MIOPEN_FIND_MODE: "1"
+    # ROCBLAS_MATH_MODE: "1"
 
     # RCCL defaults for the validated eight-card topology.
     # Override these for a different NIC/GPU topology.
@@ -49,7 +49,13 @@ environment:
     # group; set either switch to "0" to fall back to the baseline behavior.
     TURBO_PHYSAI_DDP_STATIC_GRAPH: "1"
     TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS: "1"
-  unset: []
+  # ``set`` only forces values; anything the caller's shell already exported
+  # passes through untouched. List MIOpen/rocBLAS tuning variables here to
+  # guarantee a clean baseline regardless of the launching shell.
+  unset:
+    - MIOPEN_FIND_MODE
+    - MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32
+    - ROCBLAS_MATH_MODE
 
 # The reference implementation ships tools/dist_train_numa.sh, so the recipe
 # keeps NUMA-aware placement enabled.

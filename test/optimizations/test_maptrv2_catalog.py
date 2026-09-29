@@ -30,6 +30,7 @@ EXPECTED_GROUPS = {
     "maptrv2.spconv_registry": Mechanism.REGISTRY_OVERRIDE,
     "maptrv2.bev_pool_fix": Mechanism.REPLACE,
     "maptrv2.reference_boundaries": Mechanism.WRAPPER,
+    "maptrv2.dataset_vectorization": Mechanism.REPLACE,
     "maptrv2.ddp_static_graph": Mechanism.WRAPPER,
 }
 
@@ -124,9 +125,9 @@ class CatalogTest(unittest.TestCase):
             sorted(catalog.__all__),
             [
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
-                "DDP_STATIC_GRAPH", "EFFICIENTNET", "GRID_MASK", "MATCH_COST",
-                "PV_MASK", "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY",
-                "TRAINING",
+                "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
+                "GRID_MASK", "MATCH_COST", "PV_MASK",
+                "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "TRAINING",
             ],
         )
         for group_id in EXPECTED_GROUPS:

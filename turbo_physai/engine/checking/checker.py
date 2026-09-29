@@ -330,7 +330,16 @@ class Checker:
                     _result(
                         "runtime_condition.signature",
                         (
-                            CheckStatus.UNKNOWN
+                            (
+                                # A native extension target exposes no Python
+                                # signature to bind the probe against, so there
+                                # is nothing to check -- same as
+                                # ``target.signature`` above.  UNKNOWN would
+                                # block every native target unconditionally.
+                                CheckStatus.NOT_APPLICABLE
+                                if native_artifact
+                                else CheckStatus.UNKNOWN
+                            )
                             if condition_signature_ok is None
                             else (
                                 CheckStatus.PASS

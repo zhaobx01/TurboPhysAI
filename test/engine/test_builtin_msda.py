@@ -1,6 +1,7 @@
 # Copyright 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import inspect
 import subprocess
 import sys
 import types
@@ -13,6 +14,7 @@ import yaml
 from turbo_physai.engine.contracts import Mechanism
 from turbo_physai.engine.definitions.registry import Registry, default_registry
 from turbo_physai.engine.execution.replacements import default_handlers
+from turbo_physai.engine.execution.replacements.base import resolve_replacement
 from turbo_physai.optimizations.common.mmcv import catalog
 
 
@@ -61,6 +63,21 @@ class BuiltinMsdaTest(unittest.TestCase):
             ["mmcv.msda"],
         )
 
+    def test_declares_the_lightop_runtime_condition(self):
+        """The reference falls back to mmcv when lightop is missing."""
+
+        condition = (
+            "turbo_physai.operators.multi_scale_deformable_attention."
+            "lightop_available"
+        )
+        for spec in catalog.MSDA.specs:
+            with self.subTest(target=spec.target):
+                self.assertEqual(spec.runtime_condition, condition)
+                probe = resolve_replacement(spec.runtime_condition)
+                self.assertTrue(callable(probe))
+                self.assertFalse(inspect.isclass(probe))
+                self.assertIsInstance(probe(), bool)
+
     def test_target_pair_applies_and_restores_together(self):
         def original_forward(*args, **kwargs):
             return args, kwargs
@@ -84,6 +101,7 @@ class BuiltinMsdaTest(unittest.TestCase):
         )
         replacement.ms_deform_attn_forward = replacement_forward
         replacement.ms_deform_attn_backward = replacement_backward
+        replacement.lightop_available = lambda *args, **kwargs: True
         modules = {
             "mmcv": mmcv,
             "mmcv._ext": ext,
@@ -99,8 +117,17 @@ class BuiltinMsdaTest(unittest.TestCase):
                 prepared = handler.prepare(registry.get_spec(replacement_id), {})
                 snapshots.append(handler.snapshot(prepared))
                 handler.apply(prepared)
-            self.assertIs(ext.ms_deform_attn_forward, replacement_forward)
-            self.assertIs(ext.ms_deform_attn_backward, replacement_backward)
+            # The lightop probe installs a dispatcher, so the replacement is
+            # reached through it rather than being bound directly.
+            self.assertIsNot(ext.ms_deform_attn_forward, original_forward)
+            self.assertIs(
+                ext.ms_deform_attn_forward.__turbo_physai_optimized__,
+                replacement_forward,
+            )
+            self.assertIs(
+                ext.ms_deform_attn_backward.__turbo_physai_optimized__,
+                replacement_backward,
+            )
             for snapshot in reversed(snapshots):
                 handler.restore(snapshot)
 
@@ -165,6 +192,43 @@ assert calls[1] == (
     "backward", value, shapes, starts, locations, weights,
     "contiguous-gradient", grad_value, grad_locations, grad_weights, 64,
 )
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).parents[2],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_missing_lightop_stays_importable_and_reports_unavailable(self):
+        """Without lightop the module must import and the probe must say no.
+
+        The engine uses the probe to fall back to the mmcv extension, so a
+        failing import here would turn the reference's graceful `except
+        ImportError` into a hard apply-time failure.
+        """
+
+        script = r'''
+import sys
+import types
+
+# A bare ``lightop`` without the ``op`` submodule makes the guarded import
+# fail the same way an uninstalled package would.
+sys.modules["lightop"] = types.ModuleType("lightop")
+
+from turbo_physai.operators import multi_scale_deformable_attention as msda
+
+assert "torch" not in sys.modules
+assert msda.lightop_available() is False
+assert msda.lightop_available(1, "x", a=2) is False
+try:
+    msda.ms_deform_attn_forward(None, None, None, None, None, 64)
+except RuntimeError as exc:
+    assert "lightop is not installed" in str(exc), str(exc)
+else:
+    raise AssertionError("expected RuntimeError when lightop is unavailable")
 '''
         completed = subprocess.run(
             [sys.executable, "-c", script],

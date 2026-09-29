@@ -10,6 +10,16 @@ compatibility:
   commits:
   - e03f097abef19e1ba3fed5f471a8d80fbfa0a064
 optimization_groups:
+- id: mmcv.msda
+  enabled: true
+  options: {}
+  trust:
+    source_hashes:
+      mmcv._ext.ms_deform_attn_forward:
+      - artifact-v1:097e3e04f24888c9ae5f1de1ea870f0a0f7992a2b554f1a9e430889323505b8f
+      mmcv._ext.ms_deform_attn_backward:
+      - artifact-v1:097e3e04f24888c9ae5f1de1ea870f0a0f7992a2b554f1a9e430889323505b8f
+    ast_hashes: {}
 - id: maptrv2.training
   enabled: true
   options: {}
@@ -30,6 +40,16 @@ optimization_groups:
     ast_hashes:
       projects.mmdet3d_plugin.datasets.builder.build_dataloader:
       - ast-v1:bf985ea31b75f97862ffacdd8310e2908b7a3ea6f9025f999da007ef3fb0294c
+- id: maptrv2.bev_pool_fix
+  enabled: true
+  options: {}
+  trust:
+    source_hashes:
+      projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool:
+      - source-v1:e06d404df30ac59e8d826e60cbb378382be1f622d954eca7c32c397ed245d4f0
+    ast_hashes:
+      projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool:
+      - ast-v1:f28bb5f5942e70bd6f9e03c51aa500f0ea0c8e3e2a40242222199ef3ecec9176
 - id: maptrv2.grid_mask
   enabled: true
   options: {}
@@ -68,6 +88,16 @@ optimization_groups:
       - ast-v1:c2caf1cc9752b888c51178b74c07e711ec4034fab3632fd7a247c7ff554d0396
       projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset.VectorizedLocalMap.gen_vectorized_samples:
       - ast-v1:3b5d934af83d058dcd635523240b54f232bfdd80891708c63c1eb67d7b97fc81
+- id: maptrv2.dataset_vectorization
+  enabled: true
+  options: {}
+  trust:
+    source_hashes:
+      projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset.LiDARInstanceLines.shift_fixed_num_sampled_points_v2:
+      - source-v1:876efb1b499779dcf6f36b03fc3082f1bd09b4f3cd89875e82073e2e2733b883
+    ast_hashes:
+      projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset.LiDARInstanceLines.shift_fixed_num_sampled_points_v2:
+      - ast-v1:d55af6421a714368426166fbc2aeac7cb9644ea8f176c5f03a3136c9276e55cc
 - id: maptrv2.efficientnet
   enabled: true
   options: {}
@@ -80,16 +110,6 @@ optimization_groups:
   trust:
     source_hashes: {}
     ast_hashes: {}
-- id: maptrv2.bev_pool_fix
-  enabled: true
-  options: {}
-  trust:
-    source_hashes:
-      projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool:
-      - source-v1:e06d404df30ac59e8d826e60cbb378382be1f622d954eca7c32c397ed245d4f0
-    ast_hashes:
-      projects.mmdet3d_plugin.maptr.modules.encoder.BaseTransform.bev_pool:
-      - ast-v1:f28bb5f5942e70bd6f9e03c51aa500f0ea0c8e3e2a40242222199ef3ecec9176
 - id: maptrv2.compile
   enabled: true
   options: {}
@@ -191,4 +211,5 @@ optimization_groups:
       mmcv.parallel.distributed.MMDistributedDataParallel.__init__:
       - ast-v1:00cfafdd62ab54bf4f1e2b11534b648ba62b811b27a9f1ad59c70d1f7b1b87be
 optimization_modules:
+- turbo_physai.optimizations.common.mmcv.catalog
 - turbo_physai.optimizations.models.maptrv2_optimization.catalog

@@ -34,6 +34,8 @@ Group                                        Reference change
                                              override registry entries
 ``maptrv2.reference_boundaries``             eight extracted helper boundaries
                                              plus the reference BEV layout
+``maptrv2.dataset_vectorization``            arc-length resampling for
+                                             ``shift_fixed_num_sampled_points_v2``
 ``maptrv2.ddp_static_graph``                 ``static_graph=True`` and
                                              ``find_unused_parameters=False``
                                              on ``MMDistributedDataParallel``
@@ -175,6 +177,20 @@ PV_MASK = group(
             "pv_mask.gen_vectorized_samples"
         ),
         runtime_condition=_PV_MASK_CONDITION,
+    ),
+)
+
+DATASET_VECTORIZATION = group(
+    "maptrv2.dataset_vectorization",
+    replace(
+        target=(
+            "projects.mmdet3d_plugin.datasets.nuscenes_offlinemap_dataset."
+            "LiDARInstanceLines.shift_fixed_num_sampled_points_v2"
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "dataset_vectorization.shift_fixed_num_sampled_points_v2"
+        ),
     ),
 )
 
@@ -329,6 +345,7 @@ __all__ = [
     "BEV_POOL_FIX",
     "COMPILE",
     "DATA",
+    "DATASET_VECTORIZATION",
     "DDP_STATIC_GRAPH",
     "EFFICIENTNET",
     "GRID_MASK",

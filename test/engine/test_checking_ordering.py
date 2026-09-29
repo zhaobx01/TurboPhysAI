@@ -283,6 +283,47 @@ class CheckingOrderingTest(unittest.TestCase):
         self.assertEqual(identity.status, CheckStatus.PASS)
         self.assertEqual(prepared_execution.groups[0].decision, Decision.APPLY)
 
+    def test_native_callable_accepts_a_runtime_condition(self):
+        """A native target has no signature to bind the probe against.
+
+        Reporting UNKNOWN here would block every native extension target that
+        carries a ``runtime_condition``. That is how ``mmcv.msda`` silently
+        stopped applying once the LightOp probe was added.
+        """
+
+        registry = Registry()
+        registry.register_spec(
+            ReplacementSpec(
+                "native.conditional",
+                Mechanism.REPLACE,
+                "optimization_engine_fake.native",
+                "optimization_engine_fake.replacement",
+                runtime_condition="optimization_engine_fake.positive",
+            )
+        )
+        registry.register_group(
+            OptimizationGroup("native.cond.group", ("native.conditional",))
+        )
+        entry = OptimizationGroupConfig(
+            "native.cond.group",
+            trust=FrozenDict(
+                {
+                    "source_hashes": {
+                        "optimization_engine_fake.native": source_hash(native_callable)
+                    }
+                }
+            ),
+        )
+
+        prepared_execution = self.prepare(registry, config(entry))
+        condition = next(
+            check
+            for check in prepared_execution.groups[0].checks
+            if check.code == "runtime_condition.signature"
+        )
+        self.assertEqual(condition.status, CheckStatus.NOT_APPLICABLE)
+        self.assertEqual(prepared_execution.groups[0].decision, Decision.APPLY)
+
     def test_standard_model_wrapper_still_checks_target_identity(self):
         registry = Registry()
         registry.register_spec(

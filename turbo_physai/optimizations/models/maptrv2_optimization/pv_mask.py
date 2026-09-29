@@ -43,18 +43,19 @@ def sample_line_arc_length(line_ego, n_points=PV_MASK_SAMPLES):
     Equivalent to ``[line_ego.interpolate(distance) for distance in
     np.linspace(0, line_ego.length, n_points)]`` without the shapely calls, and
     independent of the coordinate dimensionality of the source line.
+
+    Shares its arc-length core with ``dataset_vectorization`` so the two
+    replacements cannot drift apart.
     """
 
+    from .dataset_vectorization import cumulative_lengths, resample_coordinates
+
     xs, ys = np.asarray(line_ego.xy, dtype=np.float64)
-    segment_lengths = np.hypot(np.diff(xs), np.diff(ys))
-    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    distances = np.linspace(0.0, cumulative[-1], n_points)
-    return np.stack(
-        [
-            np.interp(distances, cumulative, xs),
-            np.interp(distances, cumulative, ys),
-        ],
-        axis=1,
+    coordinates, cumulative = cumulative_lengths(np.stack((xs, ys), axis=1))
+    return resample_coordinates(
+        coordinates,
+        cumulative,
+        np.linspace(0.0, cumulative[-1], n_points),
     )
 
 

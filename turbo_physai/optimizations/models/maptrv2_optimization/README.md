@@ -21,6 +21,7 @@ maptrv2_optimization/
 │   ├── compat.py                # torch.compile / dynamo 能力探测
 │   ├── compile.py               # torch.compile / dynamo.disable 包装器
 │   ├── data.py                  # build_dataloader（pin_memory=True）
+│   ├── dataset_vectorization.py # 弧长重采样核心 + shift_fixed_num_sampled_points_v2
 │   ├── ddp.py                   # DDP 构造点的 static_graph 注入
 │   ├── grid_mask.py             # Dynamo 安全的 GridMask.forward
 │   ├── match_cost.py            # cdist(p=1) -> 广播减法
@@ -31,7 +32,8 @@ maptrv2_optimization/
 ```
 
 测试位于仓库级 `TurboPhysAI/test/optimizations/`，文件名为
-`test_maptrv2_catalog.py`、`test_maptrv2_ddp.py` 和 `test_maptrv2_implementations.py`。
+`test_maptrv2_catalog.py`、`test_maptrv2_dataset_vectorization.py`、`test_maptrv2_ddp.py`
+和 `test_maptrv2_implementations.py`。
 
 `configs/optimization.yaml` 不在仓库里：它必须由 `optimization generate` 在干净
 基线 worktree 上产出（`trust` 是 target 的源码/AST 哈希，手写必然过期）。
@@ -40,17 +42,20 @@ maptrv2_optimization/
 
 | Group ID | 作用 | 默认 | 关键环境变量 |
 | --- | --- | --- | --- |
+| `mmcv.msda` | 把 `mmcv._ext.ms_deform_attn_forward/backward` 换成 LightOp 后端，对应参考实现里 `ext_module` 的 lightop 替换；`lightop` 缺失时由 `runtime_condition` 回退到 mmcv 原算子。**来自公共层**，由 `extends: framework.mmcv.hcu` 引入（见 `note.md` §3.7.2 K4） | 开 | — |
 | `maptrv2.training` | channels-last（`model` 或 `backbone`）、输入 NHWC 前处理、`cudnn.benchmark=True` / `deterministic=False`、`set_float32_matmul_precision("high")`、`fork` 启动 | 开 | `TURBO_PHYSAI_CHANNELS_LAST`、`TURBO_PHYSAI_CHANNELS_LAST_SCOPE`、`TURBO_PHYSAI_MATMUL_PRECISION`、`TURBO_PHYSAI_CUDNN_BENCHMARK`、`TURBO_PHYSAI_FORK_START_METHOD`、`TURBO_PHYSAI_DATALOADER_START_METHOD` |
 | `maptrv2.data` | `build_dataloader` 使用 `pin_memory=True`，Host→Device 拷贝可与计算重叠 | 开 | `TURBO_PHYSAI_PIN_MEMORY=0` 关闭 |
 | `maptrv2.grid_mask` | 保留官方掩码构造，只补 `np.copy()`（PIL 缓冲区只读）并把 `.cuda()` 换成 `x.device`；`forward` 常驻 `torch._dynamo.disable` | 开 | — |
 | `maptrv2.match_cost` | `OrderedPtsL1Cost` 用广播减法替换 `torch.cdist(p=1)`，避开 ROCm 覆盖不足的 kernel | 开 | — |
 | `maptrv2.pv_mask` | 辅助 PV 分割 GT 的 `line_ego_to_pvmask` 改为 numpy 弧长重采样，省掉每条线每路相机 200 次 shapely 调用；BEV 语义掩码的 `line_ego_to_mask` 把 `scale` + 平移两次 `shapely.affinity` 调用合并成一次 `scale_translate_geom`，并把 `np.array(list(coords))` 换成 `np.asarray`（逐像素一致）；第三个目标是 `gen_vectorized_samples`，顺带做掉参考实现去掉的 `LineString(np.array(instance))` 多余顶点拷贝 | 开 | `TURBO_PHYSAI_DISABLE_PV_MASK=1` 关闭 |
+| `maptrv2.dataset_vectorization` | 把 `LiDARInstanceLines.shift_fixed_num_sampled_points_v2` 的逐点 shapely 插值换成 numpy 累积弧长 + `np.interp`；只挂 `v2` 一个 property（同族其余 property 只在 `v0`/`v1`/`v3`/`v4` 下才会被读到）。输出与基线逐位一致 | 开 | — |
 | `maptrv2.efficientnet` | 允许 `EfficientNet` 覆盖 registry 中同名条目 | 开 | — |
 | `maptrv2.compile` | 给基线上携带编译挂点的 10 个热方法套 `torch.compile(mode="max-autotune-no-cudagraphs")`：`MapTRPerceptionTransformer.format_feats`、`MapTRDecoder.forward`、`MapTRv2.extract_img_feat`、`LSSTransform.get_cam_feats`/`get_mlp_input`、`maptrv2_head` 的 `normalize_3d_pts`、`normalize_2d_bbox`、`normalize_2d_pts`、`denormalize_2d_bbox`、`denormalize_2d_pts`；由 `compat.torch_compile_available` 逐次调用判定 | 开 | `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 关闭 |
 | `maptrv2.assigner` | 静态契约（`pad_to_static_list` / `get_target_single` / `get_label_result`）加 `torch._dynamo.disable` 隔离 SciPy Hungarian 求解；`assign` 自身的 `torch.compile` 另由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制，默认不开 | 开 | `TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC=1` 关闭静态化 |
 | `maptrv2.bev_pool_fix` | ROCm `bev_pool` 返回 `[B,Z,H,W,C]`，补一次 permute 回到 `[B,C,Z,H,W]`，并吸收参考实现的布尔掩码索引替换 | 开 | — |
 | `maptrv2.spconv_registry` | 允许仓库自带 SparseConv 覆盖 registry 中已注册条目；当前运行时 mmdet3d 已带 `force=True`，实际为空操作 | 开 | — |
 | `maptrv2.ddp_static_graph` | 在 `MMDistributedDataParallel` 的构造点注入 `static_graph=True` 与 `find_unused_parameters=False`。基线 `mmdet_train.py` 没有 `ddp_static_graph` 字段，所以不从 config 走，改为 wrap 该类的 `__init__`（只在 mmcv 子类上遮蔽继承，不动 Torch 的 DDP） | 开 | `TURBO_PHYSAI_DDP_STATIC_GRAPH=0`、`TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS=0` |
+| `maptrv2.reference_boundaries` | 包装 5 个基线原生调用方（`get_geometry_v1`/`BaseTransform.forward`/`LSSTransform.forward`/`transformer.forward`/`head.forward`），在内部重建参考实现抽出的 8 个 helper 与 5D BEV layout，用于复刻参考的编译边界 | 开 | `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 关闭 |
 
 `maptrv2.compile` 的 mode 与参考实现一致（参考 19 处挂点中 18 处用
 `max-autotune-no-cudagraphs`），但收益仍需在目标机型上完成精度/吞吐 A/B 后再确认。

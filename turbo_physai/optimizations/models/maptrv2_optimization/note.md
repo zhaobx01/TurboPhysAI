@@ -726,7 +726,10 @@ torchrun $DISTRIBUTED_ARGS --no-python bash -c '
 
 **优点**：`lightop` 是 Hygon 针对 DCU 优化的 MS-Deformable-Attention CUDA 扩展，性能优于 mmcv 通用实现；`try/except` 保证在 lightop 未安装时自动 fallback 到 mmcv，不影响可移植性。
 
-**归属**：这是运行时 import 级别的替换，写在模型源码中。TurboPhysAI 的通用 `mmcv.msda` Group patch 的是 mmcv 层的符号，与 lightop 是不同路径；若 lightop 已安装则 mmcv.msda 不会在关键路径生效。**当前未通过 TurboPhysAI recipe 管理**，属于需要随模型源码部署 lightop 库的硬件适配项。
+**归属**：参考实现把这一步写在模型源码里。TurboPhysAI 通过通用 `mmcv.msda` Group 达到了同一效果——
+它 patch 的是 `mmcv._ext` 的函数符号，而插件的 `ext_module` 正是 `mmcv._ext` 本体，
+所以替换会传到模型调用点，**不需要改模型源码**。**已通过 `extends: framework.mmcv.hcu` 接入**
+（见 §3.7.2 K4）。
 
 #### B15. MIOpen / rocBLAS 运行时调优
 
@@ -1128,7 +1131,7 @@ def hungarian_match(self, cost, gt_labels, assigned_gt_inds, assigned_labels, nu
 > `maptrv2.cdist_bbox_cost`、`maptrv2.efficientnet.force_register`、
 > `maptrv2.assigner.static_hungarian`、`maptrv2.torch_compile`）与 `extends` 的三条并列 id
 > 都没有落地。实际生效的是 `configs/recipe.yaml`（手写源）与 `configs/optimization.yaml`
-> （生成产物），group id 为 12 个 `maptrv2.*`，`extends` 处于注释状态——对照 §2.6 与 §3.8.4。
+> （生成产物），group id 为 13 个 `maptrv2.*` 加上 `extends` 带来的 `mmcv.msda`——对照 §2.6 与 §3.8.4。
 > 下面保留草案原文，用于说明设计意图与最终形态的差异。
 
 ```yaml
@@ -1231,33 +1234,33 @@ common/configs/recipe.yaml（id: common.hcu.base）
 
 解析机制在 `turbo_physai/engine/config/loader.py`：`OptimizationConfigCatalog.from_builtin_files()` 启动时 glob 全部 `optimizations/**/configs/optimization.yaml`，按各自 `metadata.id` 注册进同一个目录；`_resolve_extends()` 递归取出 `extends` 列出的父配置先展开，再用 `_merge()` 按 group `id` 去重合并（子配置同 id 覆盖父配置字段，否则原样带过来），`optimization_modules` 同样合并去重。所以继承链接通时，最终 `configs/optimization.yaml` 底部会列出三个模块。
 
-> **注意：这条链当前处于断开状态。**
-> `maptrv2_optimization/configs/recipe.yaml:18-20` 里 `extends` 整段被注释掉：
+> **注意：实际接线只接通了这条链的左边一半。**
+> `maptrv2_optimization/configs/recipe.yaml` 里 `extends` 指向的是 **`framework.mmcv.hcu`**，
+> 而不是上面图中的 `common.hcu.base`：
 >
 > ```yaml
-> # extends:
-> #   # 继承自 common.hcu.base 配置，包含了基础的优化配置和通用设置
-> #   - common.hcu.base
+> extends:
+>   - framework.mmcv.hcu
 > ```
 >
-> 因此生成的 `optimization.yaml` **没有 `extends` 键**，`optimization_modules` 只有一行
-> （`optimization.yaml:183-184`）：
+> 原因是 `framework.mmcv.hcu` 只含 `mmcv.msda` 一个 group，正好对应参考实现里
+> lightop 后端替换那一项（§3.7.2 K4）；而 `common.hcu.base` 会额外带进 6 个 `mmdet3d.*`
+> group，§3.6.2 已核实那些在 MapTRv2 参考实现里没有对应改造。这与
+> `bevformer/configs/recipe.yaml` 的做法一致（那里也只 extends `framework.mmcv.hcu`）。
+>
+> 所以当前生效的是：**`mmcv.msda` 在配置里，6 个 `mmdet3d.*` 不在**。
+> 生成的 `optimization.yaml` 因此是：
 >
 > ```yaml
 > optimization_modules:
+> - turbo_physai.optimizations.common.mmcv.catalog
 > - turbo_physai.optimizations.models.maptrv2_optimization.catalog
 > ```
->
-> 上面那张图描述的是**设计意图**，不是当前生效的状态。在当前配置下，
-> `mmcv.msda` 与 6 个 `mmdet3d.*` 这 7 个框架层 group **不会被激活**——这是 §3.6.2
-> 「核实结论」需要随之改写的原因。同族的 `bevformer/configs/recipe.yaml:14-15` 与
-> `bevfusion/configs/recipe.yaml:14-15` 仍然接着这条链，只有 MapTRv2 的 recipe 断开了
-> （MapTRv2 自己用 `maptrv2.bev_pool_fix` 等专属 group 覆盖了同一条路径，见 §3.7.1 U3）。
 >
 > 另外 `common/mmcv/catalog.py:11-25` 定义了一个 `mmcv.mdc` group，但它**没有被任何
 > 配置文件的 `optimization_groups` 引用**，属于定义了但从未启用的项。
 
-`maptrv2_optimization/catalog.py` 的 `__all__` 列出 12 个 `maptrv2.*` group；`mmcv.msda` 和 6 个 `mmdet3d.*` group 的定义（`id`、`optimization_modules`、默认 `enabled`）完全来自这条 `extends` 链，本包代码里既不定义也不注册它们。继承链一旦重新接通，它们会被并入最终生成的配置；当前断开状态下则完全不在配置里。
+`maptrv2_optimization/catalog.py` 的 `__all__` 列出 13 个 `maptrv2.*` group；`mmcv.msda` 和 6 个 `mmdet3d.*` group 的定义（`id`、`optimization_modules`、默认 `enabled`）完全来自这条 `extends` 链，本包代码里既不定义也不注册它们。当前 `extends` 只指向 `framework.mmcv.hcu`，所以只有 `mmcv.msda` 进了最终配置；把 `extends` 改成 `common.hcu.base` 才会把 6 个 `mmdet3d.*` 一并并入。
 
 ---
 
@@ -1428,7 +1431,7 @@ turbo-physai run \
 | assigner 静态打包 + Hungarian 隔离 | B8、§4.13 | **已接入**：`assigner.py` 实现了 `pad_to_static_list`、`get_label_result`、`_hungarian_match_impl`（`torch._dynamo.disable` 隔离 SciPy 求解）、`static_loss`、`get_target_single`，通过 `maptrv2.assigner` 的 3 个 `replace` 目标（`assign`/`loss`/`_get_target_single`）落地。唯一差异：参考对 `assign` 用 `@torch.compile(options={"triton.cudagraphs": True, "triton.cudagraph_trees": False})`，本包由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制且**默认 `"0"`（不编译）**，编译选项也不同 |
 | EfficientNet `force=True` 注册 | B9 | 已通过 `registry_override` 接入 `maptrv2.efficientnet` |
 | SparseConv 全部 `register_module(force=True)` | §3.6.2 | 已通过 `registry_override` 接入 `maptrv2.spconv_registry`；但**当前运行时环境中是空操作**——实际导入的 mmdet3d 是 dist-packages 里那个由参考树构建的 wheel，它本身已经带 `force=True`（见 §3.6.2、§3.8） |
-| 数据集向量化第二梯队（`_interpolate_line_points_vectorized`、`shift_fixed_num_sampled_points_v2` 缓存） | §3.7.1 U6 | **未接入**：`pv_mask.py` 只覆盖 `line_ego_to_pvmask`/`line_ego_to_mask`/`gen_vectorized_samples`，没有 patch 这两个 |
+| 数据集向量化第二梯队（`_interpolate_line_points_vectorized`、`shift_fixed_num_sampled_points_v2` 向量化） | §3.7.1 U6 | **部分接入**：`maptrv2.dataset_vectorization` 已用 numpy 弧长重采样替换 `shift_fixed_num_sampled_points_v2`（与基线逐位一致，见 U6）；`_interpolate_line_points_vectorized` 及其 7 个调用点仍未接 |
 | DDP `ddp_static_graph=True` + `find_unused_parameters=False` | §3.7.1 U7 | **已接入** `maptrv2.ddp_static_graph`：基线 `mmdet_train.py` 没有 `ddp_static_graph` 字段，config 改不动，所以改为 wrap `mmcv.parallel.distributed.MMDistributedDataParallel.__init__`，在构造点注入 |
 | GDK `geometric_kernel_attn_cuda.cu` 的 `AT_DISPATCH_FLOATING_TYPES(value.type(), …)` → `value.scalar_type()` | §3.7.2 K3 | **未接入**：`build.py` 覆盖了其它构建补丁，但不含这条 `.cu` 改动 |
 | 强制选择 `CUDAExtension` 构建 | B10 | **已接入（离线构建补丁，非 recipe）**：`build.py:163 force_geometric_kernel_extension()` 对 `geometric_kernel_attn/setup.py` 做同一个 `if 1:` 替换；因为目标是构建脚本而不是运行时函数，走 `python -m ...build` 而不是 group |
@@ -1438,7 +1441,7 @@ turbo-physai run \
 | `set_float32_matmul_precision("high")` | B13 | 已接入 `maptrv2.training` |
 | head 中 `get_label_result`、`pad_to_static_list` 抽取 | B8、§4.13 | **已接入**：两者都在 `assigner.py` 中实现（而不是作为 head 的新方法），由 `maptrv2.assigner` 的 `loss` / `_get_target_single` 替换在内部调用 |
 | encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5/B6.3、§4.12 | **已接入，但当前配置下 `bev_pool_fix` 被旁路**：ROCm `bev_pool` 返回 `[B,Z,H,W,C]` 而非 CUDA 的 `[B,C,Z,H,W]`，会让后续 `downsample` Conv2d channel 维不匹配崩溃。`maptrv2.bev_pool_fix` 在 monkey-patch 层修正 layout 并顺带做了参考的 `index_select`→`x[kept]` 布尔掩码替换。`down_sample` 的 collapse-Z+downsample 合并通过 `maptrv2.reference_boundaries` 的 `LSSTransform.forward`/`BaseTransform.forward` 包装接入（见 B6.3），现在 `enabled: true`。**两者是同一段逻辑的两个实现，而 `reference_boundaries` 的 `base_transform_forward` 直接调 `_bev_pool_5d`、不再走 `self.bev_pool`，所以 Group 全开时 `bev_pool_fix` 在主训练路径上是死代码**（它仍是 `reference_boundaries` 关闭时的兜底）。详见 §3.8 |
-| `lightop` DCU Deformable Attention 算子替换 | B14 | **未接入 TurboPhysAI recipe**：以 try/except 写在模型源码中；`mmcv.msda` 替换的是 mmcv 层符号，与 lightop 路径不重叠 |
+| `lightop` DCU Deformable Attention 算子替换 | B14、K4 | **已接入**：`extends: framework.mmcv.hcu` 引入 `mmcv.msda`，它替换 `mmcv._ext` 的函数符号；插件的 `ext_module` 就是 `mmcv._ext` 本体，替换直接传到调用点。参考的 `except ImportError` 由 `runtime_condition` 探针等价实现 |
 
 #### 3.6.2 `mmdetection3d` 与部署层
 
@@ -1462,10 +1465,10 @@ turbo-physai run \
 `x = x.permute(...)`、spconv 0 处 `force=True`）**不被导入**，只是构建资产。
 下表描述的是**仓库树**里的代码，用来对照参考实现的 diff；判断运行时行为要以上面这个 wheel 为准。
 
-**核实结论**：§2.6 那条 `extends` 链带来的 7 个框架层公共优化（`mmcv.msda` + 6 个 `mmdet3d.*`），
-在**当前配置下根本没被激活**——`recipe.yaml:18-20` 的 `extends` 整段被注释，生成的
-`optimization.yaml` 无 `extends` 键，只有 `maptrv2.*` 一个模块。所以这 7 个 group 既不来自
-模型源码，也不在生效配置里：
+**核实结论**：§2.6 那条链里的 7 个框架层公共优化（`mmcv.msda` + 6 个 `mmdet3d.*`），
+其中 **`mmcv.msda` 已经接通**（`extends: framework.mmcv.hcu`，对应参考的 lightop 后端替换，
+见 §3.7.2 K4），**另外 6 个 `mmdet3d.*` 不在配置里**——它们没有对应的参考实现改造。
+下表逐项核对这 7 个 group 的目标符号在两侧源码树里的状态：
 
 | Group | 目标符号 | 仓库源码树里的状态（不等于运行时，见上） |
 | --- | --- | --- |
@@ -1475,11 +1478,11 @@ turbo-physai run \
 | `mmdet3d.voxelization` | `...voxel.voxelize._Voxelization.forward` | `ops/voxel/voxelize.py`：调 `from .voxel_layer import dynamic_voxelize, hard_voxelize`——mmdet3d 自带、随源码编译的扩展；两侧树一致 |
 | `mmdet3d.canonical_indice_pairs` | `mmdet3d.ops.spconv.ops.get_indice_pairs` | `ops/spconv/ops.py`：调 `sparse_conv_ext.get_indice_pairs_2d/3d/4d`——mmdet3d 自带扩展，不是 `turbo_physai.ops` |
 | `mmdet3d.sparse_tensor` | `...structure.SparseConvTensor.sparity` | `ops/spconv/structure.py`：`return self.indices.shape[0] / np.prod(self.spatial_shape) / self.batch_size`，`np.prod` 写法，未替换成显式三维乘法 |
-| `mmcv.msda` | `mmcv._ext.ms_deform_attn_forward/backward` | `mmcv` 是 pip 安装依赖，不在仓库源码树内。参考树在调用侧做了替换（`lightop` fallback，见 K4），但没有对 `mmcv._ext` 做 monkeypatch |
+| `mmcv.msda` | `mmcv._ext.ms_deform_attn_forward/backward` | `mmcv` 是 pip 安装依赖，不在仓库源码树内。参考树在**调用侧**把 `ext_module` 换成 lightop（见 K4），本包则在**被调用侧**替换 `mmcv._ext` 的符号——因为 `ext_loader.load_ext` 返回的就是 `mmcv._ext` 本体，两种做法作用到同一个调用点 |
 
 六个 `mmdet3d.*` 替换调用的都是 mmdet3d/mmdetection3d **自带的原生编译扩展**（`bev_pool_ext`、`voxel_layer`、`sparse_conv_ext`），不是 `turbo_physai.ops` 打包的版本。其中 `bev_pool` 是唯一一个参考实现真正动过源码的（改法见上表）；其余 5 个在两侧树里都是上游原样。
 
-这 7 个框架层 group 设计上不要求改动模型源码，能否生效完全取决于配置里对应 `enabled` 开关是否打开、monkeypatch 是否被触发。当前配置下它们不在 `optimization.yaml` 里，因此**一个都没生效**；要让它们生效，需要取消 `recipe.yaml:18-20` 的 `extends` 注释并重新生成配置。
+这 7 个框架层 group 设计上不要求改动模型源码，能否生效完全取决于配置里对应 `enabled` 开关是否打开、monkeypatch 是否被触发。当前 `mmcv.msda` 在配置里并生效，6 个 `mmdet3d.*` 不在；后者要生效需要把 `extends` 改成 `common.hcu.base` 并重新生成配置——但如上一段所述，它们对 MapTRv2 并没有对应的参考改造，接通只是徒增噪声。
 
 需要说明的是，baseline 源码里**没有**任何 `@torch.compile` 装饰器（19 个挂点全在参考树里），所以 `maptrv2.compile` 这类 group 不会被"源码里写死的装饰器"绕过——早先版本的本节文字有过这个推断，已在 §3.8 更正。
 
@@ -1504,18 +1507,20 @@ MapTRv2 专属优化（11 个 group 全部 enabled: true）
 未接入的缺口
 ├── 数据集向量化第二梯队（_interpolate_line_points_vectorized、shift_fixed_num_sampled_points_v2 缓存）
 ├── GDK geometric_kernel_attn_cuda.cu 的 AT_DISPATCH value.scalar_type() 改动
-└── lightop 算子替换（需要 import 层切换，replace/wrap 够不到）
+└── lightop 算子替换（已接入，mmcv.msda；缺 lightop 时自动回退）
 
 mmdet3d 与部署层
-├── 框架层通用优化：extends 链当前断开，7 个 group 全部未生效
+├── 框架层通用优化：extends 只接了 framework.mmcv.hcu（mmcv.msda 生效），
+│                 6 个 mmdet3d.* 未接线
 └── 构建兼容补丁：build.py 已离线覆盖 mmcv_maximum_version / numba / ATen include /
                  __CUDACC__ / c++17 / GDK setup.py "if 1:"，不含上面那条 .cu 改动
 ```
 
-因此当前的说法应该是：**12 个 `maptrv2.*` group 全部已接入并处于启用状态，但其中两项
+因此当前的说法应该是：**13 个 `maptrv2.*` group 全部已接入并处于启用状态，但其中两项
 （`spconv_registry`、`bev_pool_fix`）在当前运行时环境下分别表现为冗余和被旁路；
 真正的缺口集中在数据集向量化第二梯队和一条 GDK 内核补丁上。**
-7 个框架层 group 不是"接入了但没生效"，而是 `extends` 链根本没接线。
+7 个框架层 group 里只有 `mmcv.msda` 接了线（`framework.mmcv.hcu`），另外 6 个不是"接入了但没生效"，
+而是 `extends` 没指向 `common.hcu.base`。
 
 开启 `maptrv2.compile` / `maptrv2.reference_boundaries` 之后，编译耗时/重编译次数/精度/吞吐
 的 A/B 仍然是必要步骤——默认 mode 与参考一致只说明配置对得上，不说明收益已在目标机型验证过。
@@ -1532,7 +1537,7 @@ mmdet3d 与部署层
   Helper 挂点（见 B6）、`maptrv2.assigner` 的静态契约（U4）、`maptrv2.ddp_static_graph`（U7）。
 - **已接入但当前不生效**：`maptrv2.assigner` 内 `assign` 的 `torch.compile`（U4）、
   `maptrv2.spconv_registry`（U8）、`maptrv2.bev_pool_fix` 的主路径（U3）。
-- **未接入**：数据集向量化第二梯队（U6）、GDK `.cu` 补丁（K3）。
+- **未接入**：`_interpolate_line_points_vectorized` 及其 7 个调用点（U6 剩余部分）、GDK `.cu` 补丁（K3）。
 - **已有等价替代**：`TransposeImage` 的输入布局处理（L2）。
 
 #### 3.7.1 跨文件与源码改造
@@ -1754,32 +1759,58 @@ if num_workers > 0:
 `replace` 目标未变，仍是 `projects.mmdet3d_plugin.datasets.builder.build_dataloader`。回归测试
 见 `test/optimizations/test_maptrv2_data.py`（§3.4）。
 
-**U6. 数据集向量化第二梯队（未接入）**
+**U6. 数据集向量化第二梯队（部分接入）**
 
-`maptrv2.pv_mask` 覆盖的是 PV mask 相关的三个方法，但参考实现对
-`nuscenes_offlinemap_dataset.py` 的向量化改造还有另外两处，本包没有接：
+参考实现对 `nuscenes_offlinemap_dataset.py` 的向量化改造分两批。`maptrv2.pv_mask`
+覆盖了 PV/BEV mask 那批，第二批里 `shift_fixed_num_sampled_points_v2` 已由
+**`maptrv2.dataset_vectorization`** 接入，其余仍未接：
 
 ```text
 优化前：逐点 shapely 插值（每个 instance 一次 Python 循环）
 优化后：
   _interpolate_line_points_vectorized(line, distances)   # shapely 2.0 批量
   LiDARInstanceLines.shift_fixed_num_sampled_points_v2
-      -> @cached_property，内部走 _shift_fixed_num_sampled_points_v2_vectorized
-         （批量插值 + unique_instance_ids/duplicate_meta 去重 + 预算 shift 索引矩阵）
+      -> 批量弧长重采样
 ```
 
 | 参考实现位置（`/workspace/MapTRv2/.../nuscenes_offlinemap_dataset.py`） | 内容 | 本包 |
 | --- | --- | --- |
-| `:38-48` | `_interpolate_line_points_legacy` / `_interpolate_line_points_vectorized`，`:47` 按 shapely 版本二选一 | 无 |
-| `:184, :204, :258, :368, :379, :557, :566` | 7 个调用点从逐点循环换成向量化版本 | 无 |
-| `:347` | 原 `shift_fixed_num_sampled_points_v2` 降级为 `_shift_fixed_num_sampled_points_v2_legacy` | 无 |
-| `:406-532` | 新增 `_shift_fixed_num_sampled_points_v2_vectorized()` | 无 |
-| `:523` + `:129` | `shift_fixed_num_sampled_points_v2` 变成 `@cached_property`，并加缓存字段 | 无 |
+| `:38-48` | `_interpolate_line_points_legacy` / `_interpolate_line_points_vectorized`，`:47` 按 shapely 版本二选一 | **未接入** |
+| `:184, :204, :258, :368, :379, :557, :566` | 7 个调用点从逐点循环换成向量化版本 | **未接入** |
+| `:347` | 原 `shift_fixed_num_sampled_points_v2` 降级为 `_shift_fixed_num_sampled_points_v2_legacy` | 已接入（见下） |
+| `:406-532` | 新增 `_shift_fixed_num_sampled_points_v2_vectorized()` | 已接入（见下） |
+| `:523` + `:129` | `shift_fixed_num_sampled_points_v2` 变成 `@cached_property`，并加缓存字段 | **未采用**（见下） |
 
-基线对应的只有 `nuscenes_offlinemap_dataset.py:321` 的原始循环实现。未接入原因：这两处的
-受益面在 dataloader worker 侧，`pv_mask.py` 目前只承载了 PV mask 的三条路径；要接入需要先
-确认目标环境的 shapely 版本（向量化分支依赖 shapely 2.0 的 `line_interpolate_point` /
-`get_coordinates`），再按同样方式增加 `replace` 目标。
+**已接入的部分**：`maptrv2.dataset_vectorization` 用 `replace` 挂在
+`LiDARInstanceLines.shift_fixed_num_sampled_points_v2`（property）上，实现是
+numpy 累积弧长 + 两次 `np.interp`：
+
+```text
+基线  每个 instance：fixed_num 次 shapely interpolate（每次分配一个 GEOS Point）
+      闭合多边形还要 × 每个顶点 shift 一次
+新版  每条线测量一次累积弧长，之后两次 np.interp 出全部采样点
+```
+
+接入范围**只保留 v2 一个目标**。同族的 `fixed_num_sampled_points` /
+`fixed_num_sampled_points_ambiguity` / `shift_fixed_num_sampled_points`(v1) 只在
+`gt_shift_pts_pattern` 取 `v0`/`v1`/`v3`/`v4` 时才会被读到，而验证过的 config 用的是 `v2`
+（`maptrv2_nusc_r50_24ep.py:103`），声明它们等于增加永不执行的 target。
+
+**与参考实现的两处有意偏离**：
+
+1. **缓存未采用**。参考把该 property 变成 `@cached_property`。但调用链上
+   `LiDARInstanceLines` 是在 `gen_vectorized_samples` 里逐样本新建的，head 的 loss 每次
+   forward 只读这个 property 一次，对象随即随 batch 丢弃——同对象不会被读第二次，缓存
+   基本不会命中，却会额外消耗 `np.random.choice` 之外的复杂度（并改变全局 RNG 消耗次数，
+   使固定 seed 下的结果与基线不逐位一致）。因此本包只做向量化，不做缓存。
+2. **不依赖 shapely 2.0**。参考的向量化分支依赖 `line_interpolate_point` /
+   `get_coordinates`（`:47` 按版本二选一）；本包直接用 numpy 复刻同样的弧长插值，没有版本依赖。
+
+**等价性**：`test/optimizations/test_maptrv2_dataset_vectorization.py` 里的
+`test_matches_the_clean_checkout_implementation` 会启动子进程，在干净 checkout 上导入真实
+`LiDARInstanceLines`，对 38 组输入（开放折线 / 闭合多边形 / `label==3` / 多实例 /
+重复顶点 / 需要 padding / 顶点数超过 shift 预算触发随机采样）逐位比对，要求
+`torch.equal` 为真。
 
 **U7. DDP 静态图（已接入）**
 
@@ -1909,8 +1940,8 @@ registry 冲突。
 的 mmdet3d 时——那种环境下它是必需的。
 
 **归属说明**：它保护的是通用 `mmdet3d` 能力，却声明在 MapTRv2 专属 catalog 里。如果要迁到
-`common/mmdet3d` 层，前提是先把 `extends: common.hcu.base` 接通（§2.6）——在继承链断开的
-状态下，放进通用层不会被这个 recipe 继承到。
+`common/mmdet3d` 层，前提是先把 `extends` 指向 `common.hcu.base`（§2.6）——当前只接了
+`framework.mmcv.hcu`，放进通用层不会被这个 recipe 继承到。
 
 **K3. 构建兼容（大部分已接入，一条缺口）**
 
@@ -1954,7 +1985,7 @@ registry 冲突。
 **为什么不做成 group**：这些是构建补丁，不是运行时优化；recipe 的 Python 替换无法处理
 C++/CUDA 编译条件，所以统一由 `build.py` 这个离线工具承载。
 
-**K4. lightop DCU Deformable Attention 算子替换（未接入）**
+**K4. lightop DCU Deformable Attention 算子替换（已接入）**
 
 参考实现在 `multi_scale_deformable_attn_function.py` 顶部以 try/except 优先加载 Hygon DCU 专用的 `lightop` 库：
 
@@ -1962,12 +1993,45 @@ C++/CUDA 编译条件，所以统一由 `build.py` 这个离线工具承载。
 try:
     from lightop import op as ext_module
 except ImportError:
-    from mmcv import _ext as ext_module
+    from mmcv.utils import ext_loader
+    ext_module = ext_loader.load_ext(
+        '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 ```
 
 作用：`lightop` 针对 DCU 的 MS-Deformable-Attention 前反向传播做了针对性优化，与 mmcv 通用实现相比在 Hygon 硬件上有明显性能差距。
 
-未接入原因：import 时已经决定加载哪个库；TurboPhysAI 的 replace/wrap 在模块导入之后才介入，无法在 import 层切换后端。`mmcv.msda` Group 替换的是 mmcv `_ext` 的符号，lightop 安装后会绕过该路径。若要通过 TurboPhysAI 管理，需要把 lightop 的前反向实现封装成独立 operator 并注册到 `turbo_physai/operators/`。
+**接入方式**：不用新写算子——`turbo_physai/operators/multi_scale_deformable_attention.py`
+本来就是 lightop 封装，`mmcv.msda` 本来就声明了替换。本次做的是**接线**：
+
+```yaml
+# maptrv2_optimization/configs/recipe.yaml
+extends:
+  - framework.mmcv.hcu      # 只含 mmcv.msda 一个 group，不带入 6 个 mmdet3d.*
+```
+
+**为什么补丁能作用到模型调用点**（本节早先版本的判断是错的，已更正）：
+mmcv 的 `ext_loader.load_ext` 实现就是 `importlib.import_module('mmcv.' + name)`，
+实测 `ext_module is mmcv._ext` 为 `True`；调用点 `ext_module.ms_deform_attn_forward(...)`
+是**调用时**才做属性查找，所以替换 `mmcv._ext.<name>` 直接传到模型调用点。
+不存在"import 期已定死、事后改不了"的问题。
+
+**为什么不用改那 4 个调用点**：`lightop.op` 是原始 pybind 模块，参数名只有位置序号
+（`ms_deform_attn_forward(arg0..arg4: Tensor, arg5: int)`），参考实现因此必须把
+`im2col_step=` 改成位置参数。本包的 Python 算子里 `im2col_step` 是**有名形参**，
+所以基线的 `im2col_step=ctx.im2col_step` 关键字调用原样可用——语义与参考一致，源码零改动。
+
+**覆盖范围**：全仓库 5 个模块绑定了 `ext_module = ext_loader.load_ext('_ext', ...)`，
+但只有 `multi_scale_deformable_attn_function.py` 真的调用它（`:42,:74,:118,:150`）；
+`decoder.py:31` / `encoder.py:25` / `temporal_self_attention.py:22` /
+`spatial_cross_attention.py:28` 都是死变量。参考树里 `lightop` 也只出现在那一个模块
+（`decoder.py` 顶部根本没被改）。它们绑定的是同一个 `mmcv._ext` 对象，所以补一处覆盖全部。
+
+**优雅退化**：参考的 `except ImportError` 由 `mmcv.msda` 的 `runtime_condition` 等价实现——
+算子模块把 lightop 导入改成受保护（缺失时置 `None`、模块仍可导入），并用
+`lightop_available()` 作为探针；探针返回 False 时引擎回退到原始 mmcv 算子。
+
+**为什么不能直接 replace 插件模块的 `ext_module` 全局**：`replace.py:52-55` 要求 target 是
+callable 或 class，而模块对象不满足，会被直接拒绝。所以必须走 `mmcv._ext` 的函数符号这条路。
 
 #### 3.7.3 低收益项与替代方案
 
@@ -2018,20 +2082,19 @@ class TransposeImage:
 已接入但当前不生效
 ├── maptrv2.assigner 内 assign 的 torch.compile（TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE 默认 0）
 ├── maptrv2.bev_pool_fix 的主路径（被 reference_boundaries 旁路）
-└── 7 个框架层 group（extends 链未接线）
+└── 6 个 mmdet3d.* 框架层 group（extends 未指向 common.hcu.base）
 
 未接入
-├── 数据集向量化第二梯队（U6）
-├── GDK geometric_kernel_attn_cuda.cu 的 scalar_type 改动（K3）
-└── lightop 算子替换（需封装到 turbo_physai/operators/）
+├── `_interpolate_line_points_vectorized` 及其 7 个调用点（U6 剩余部分）
+└── GDK geometric_kernel_attn_cuda.cu 的 scalar_type 改动（K3）
 
 收益小或已有安全替代
 └── TransposeImage（L2）
 ```
 
-因此当前最需要继续处理的是 **U6 数据集向量化第二梯队**；
-`lightop` 算子替换需要先封装到 `turbo_physai/operators/` 才能进入配置管理；
-GDK 的 `.cu` 补丁只在重建扩展时需要；`spconv_registry` 与 `bev_pool_fix` 不是缺口，
+因此当前最需要继续处理的是 **U6 里剩下的 `_interpolate_line_points_vectorized` 及 7 个调用点**；
+`mmcv.msda`（lightop 后端）已通过 `extends: framework.mmcv.hcu` 接入，缺 lightop 时自动回退到
+mmcv 算子；GDK 的 `.cu` 补丁只在重建扩展时需要；`spconv_registry` 与 `bev_pool_fix` 不是缺口，
 但在当前环境下分别是冗余和被旁路，启用配置时要知道它们没有叠加效果。
 
 10 个同名 `compile` 挂点、8 个新增 Helper 挂点和 `maptrv2.ddp_static_graph` 已经由配置启用，
@@ -2093,7 +2156,7 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 | `bev_pool` 三文件协同改造（mmdet3d 去 permute / `bev_pool` return 5D / 编译版 `down_sample`） | 已接入（`maptrv2.reference_boundaries` + `maptrv2.bev_pool_fix`），但两者重叠，见 3.8.3 |
 | `SparseConv` / `EfficientNet` `force=True` | 已接入（`spconv_registry` / `efficientnet`） |
 | 构建补丁（`c++17`、`__CUDA_ARCH__`、`mmcv_maximum_version`、numba、ATen include、`if 1:`） | 已由 `build.py` 离线覆盖 |
-| `lightop` MSDeformAttn 后端切换 | 未接入；import 层决策，`replace`/`wrap` 够不到（K4） |
+| `lightop` MSDeformAttn 后端切换 | 已接入（K4）：`mmcv.msda` 替换 `mmcv._ext` 的函数符号，插件的 `ext_module` 正是该模块本体；参考的 `except ImportError` 由 `runtime_condition` 探针等价实现 |
 | `ProfilerHook`、`test.py` DDP 兼容补丁、`map_ann_file` 硬编码、`evaluation interval=2→6` | 不属于模型优化包，不视为缺口 |
 
 #### 3.8.3 Q2：接入项是否正确接入
@@ -2121,9 +2184,10 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 
 配置事实（`configs/optimization.yaml` / `recipe.yaml` 核对）：
 
-- 12 个 `maptrv2.*` group **全部 `enabled: true`**，没有任何 `enabled: false`。
-- `recipe.yaml:18-20` 的 `extends: - common.hcu.base` **整段被注释**；`optimization.yaml`
-  无 `extends` 键，`optimization_modules` 只有 `maptrv2_optimization.catalog` 一行。
+- 13 个 `maptrv2.*` group 中 12 个 `enabled: true`，`maptrv2.reference_boundaries` 为 `false`。
+- `recipe.yaml` 的 `extends` 指向 **`framework.mmcv.hcu`**（只有 `mmcv.msda`），不是
+  `common.hcu.base`；生成产物的 `optimization_modules` 因此是两行：
+  `common.mmcv.catalog` + `maptrv2_optimization.catalog`。
 - `runtime.yaml` 未设置 `TURBO_PHYSAI_DISABLE_TORCH_COMPILE` /
   `TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC`，两者的运行时开关都在"允许"侧。
 
@@ -2137,7 +2201,8 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 | `assigner` | enabled | 静态化生效，`assign` 编译**不生效** | `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 默认 `"0"` |
 | `spconv_registry` | enabled | **冗余空操作** | 运行时 wheel 已带 `force=True`（3.8.1） |
 | `bev_pool_fix` | enabled | **被旁路** | `reference_boundaries` 抢先接管 `BaseTransform.forward`（3.8.3） |
-| `mmcv.msda` + 6 个 `mmdet3d.*` | **不在配置里** | **不生效** | `extends` 链未接线（§2.6） |
+| `mmcv.msda` | enabled（经 `extends: framework.mmcv.hcu`） | 生效 | 缺 lightop 时由 `runtime_condition` 回退到 mmcv 算子 |
+| 6 个 `mmdet3d.*` | **不在配置里** | **不生效** | `extends` 只接了 `framework.mmcv.hcu`，没接 `common.hcu.base`（§2.6） |
 
 #### 3.8.5 结论
 
@@ -2148,22 +2213,24 @@ A（未优化基线）
 
 B（PhysAI 接入层）
   ├── 12 个 maptrv2.* group 全部 enabled: true
+  ├── 另有 mmcv.msda（extends: framework.mmcv.hcu），对应 C 的 lightop 后端替换
   ├── 与 C 对齐的：19 个编译边界（10 + 8 + assigner）、精度/后端开关、
   │   cdist 替换、PV mask 向量化、bev_pool 契约、注册表覆盖、构建补丁、
-  │   DDP 静态图
+  │   DDP 静态图、lightop MSDeformAttn 后端
   ├── 与 C 有差异的：assign 的编译选项（默认不开）
-  ├── 与 C 缺口：数据集向量化第二梯队、GDK .cu
+  ├── 与 C 缺口：`_interpolate_line_points_vectorized`、GDK .cu
   └── 自身重叠/冗余：bev_pool_fix 被 reference_boundaries 旁路、
       spconv_registry 在已打补丁的 wheel 上空转
 
 C（侵入式参考）
   └── 另有 7 个框架层公共优化（mmcv.msda + 6 个 mmdet3d.*）
-        但 B 的 extends 链未接线，这 7 项当前一个都没进配置
+        B 只接了 framework.mmcv.hcu（mmcv.msda），6 个 mmdet3d.* 未接线
 ```
 
 一句话：**接入的项在语义上都对得上参考实现，主要缺口只剩数据集向量化第二梯队和 GDK 的 `.cu` 补丁；
 需要留意的是三项"接了但当前不产生效果"——`bev_pool_fix`（被旁路）、`spconv_registry`（冗余）、
-`assign` 的编译（默认关闭）——以及整条 `extends` 框架层继承链没有接线。**
+`assign` 的编译（默认关闭）——以及 `extends` 没指向 `common.hcu.base`、6 个 `mmdet3d.*`
+框架层 group 未接线。**
 
 ---
 

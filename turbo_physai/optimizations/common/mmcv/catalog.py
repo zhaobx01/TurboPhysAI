@@ -25,6 +25,14 @@ MDC = group(
 )
 
 
+# The reference implementation swaps ``ext_module`` for LightOp inside a
+# ``try``/``except ImportError``.  The probe reproduces that fallback: with
+# ``lightop`` missing the engine keeps the original mmcv extension operator.
+_LIGHT_OP_CONDITION = (
+    "turbo_physai.operators.multi_scale_deformable_attention."
+    "lightop_available"
+)
+
 MSDA = group(
     "mmcv.msda",
     replace(
@@ -33,6 +41,7 @@ MSDA = group(
             "turbo_physai.operators.multi_scale_deformable_attention."
             "ms_deform_attn_forward"
         ),
+        runtime_condition=_LIGHT_OP_CONDITION,
     ),
     replace(
         target="mmcv._ext.ms_deform_attn_backward",
@@ -40,6 +49,7 @@ MSDA = group(
             "turbo_physai.operators.multi_scale_deformable_attention."
             "ms_deform_attn_backward"
         ),
+        runtime_condition=_LIGHT_OP_CONDITION,
     ),
 )
 
