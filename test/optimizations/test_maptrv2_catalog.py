@@ -21,6 +21,8 @@ import turbo_physai.optimizations.models.maptrv2_optimization.catalog as catalog
 EXPECTED_GROUPS = {
     "maptrv2.training": Mechanism.WRAPPER,
     "maptrv2.data": Mechanism.REPLACE,
+    "maptrv2.datacontainer_pin": Mechanism.WRAPPER,
+    "maptrv2.fused_adamw": Mechanism.WRAPPER,
     "maptrv2.grid_mask": Mechanism.REPLACE,
     "maptrv2.compile": Mechanism.WRAPPER,
     "maptrv2.match_cost": Mechanism.REPLACE,
@@ -111,6 +113,13 @@ def _target_exists(repo_root, target):
             None,
         )
         if node is None:
+            # The optimizer hook targets a model-local imported alias, not a
+            # function defined in this file. Resolve its original provider.
+            for item in body:
+                if isinstance(item, ast.ImportFrom) and item.module:
+                    for alias in item.names:
+                        if (alias.asname or alias.name) == name:
+                            return _target_exists(repo_root, item.module + "." + alias.name)
             return False
         body = node.body
     return True
@@ -125,8 +134,8 @@ class CatalogTest(unittest.TestCase):
             sorted(catalog.__all__),
             [
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
-                "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
-                "GRID_MASK", "MATCH_COST", "PV_MASK",
+                "DATACONTAINER_PIN", "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
+                "FUSED_ADAMW", "GRID_MASK", "MATCH_COST", "PV_MASK",
                 "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "TRAINING",
             ],
         )
@@ -282,7 +291,7 @@ class CatalogTest(unittest.TestCase):
         script = (
             "import sys;"
             "import turbo_physai.optimizations.models.maptrv2_optimization.catalog;"
-            "sys.exit(1 if 'torch' in sys.modules else 0)"
+            "sys.exit(1 if 'torch' in sys.modules or 'apex' in sys.modules else 0)"
         )
         environment = dict(os.environ)
         # Ship the parent's import path so ``turbo_physai`` resolves in the child

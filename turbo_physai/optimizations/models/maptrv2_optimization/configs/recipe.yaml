@@ -32,6 +32,11 @@ optimization_groups:
   # DataLoader pin_memory=True.
   - id: maptrv2.data
     enabled: true
+  # v4/v3 additions remain opt-in pending target-HCU performance/accuracy runs.
+  - id: maptrv2.datacontainer_pin
+    enabled: true
+  - id: maptrv2.fused_adamw
+    enabled: true
   # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
   - id: maptrv2.bev_pool_fix
     enabled: true    

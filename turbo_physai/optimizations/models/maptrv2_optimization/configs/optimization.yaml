@@ -40,6 +40,26 @@ optimization_groups:
     ast_hashes:
       projects.mmdet3d_plugin.datasets.builder.build_dataloader:
       - ast-v1:bf985ea31b75f97862ffacdd8310e2908b7a3ea6f9025f999da007ef3fb0294c
+- id: maptrv2.datacontainer_pin
+  enabled: true
+  options: {}
+  trust:
+    source_hashes:
+      torch.utils.data._utils.pin_memory.pin_memory:
+      - source-v1:ff389a72e1df2b748e87b40e4177450dcf1b99297d2e092cfd3827f918ee436c
+    ast_hashes:
+      torch.utils.data._utils.pin_memory.pin_memory:
+      - ast-v1:04a60bd36cc1263e8460282fe996479357c7b8c2ffc8dac42080a487732a9529
+- id: maptrv2.fused_adamw
+  enabled: true
+  options: {}
+  trust:
+    source_hashes:
+      projects.mmdet3d_plugin.bevformer.apis.mmdet_train.build_optimizer:
+      - source-v1:943a9ae0974bea38b39539d619785134ce180821a846d32eef668abb35193894
+    ast_hashes:
+      projects.mmdet3d_plugin.bevformer.apis.mmdet_train.build_optimizer:
+      - ast-v1:94c928355e011ae0cc750d4efcb653a278665c1aaf7050678981ebb3c95a21b1
 - id: maptrv2.bev_pool_fix
   enabled: true
   options: {}

@@ -553,6 +553,29 @@ def test_reference_bev_pool_accepts_rocm_hw_layout(monkeypatch):
     assert result is expected
 
 
+def test_reference_bev_pool_uses_installed_fix():
+    from turbo_physai.optimizations.models.maptrv2_optimization import reference
+
+    expected = torch.zeros(1, 1, 2, 3, 4)
+    calls = []
+
+    class Model:
+        def bev_pool(self, geometry, features, *, return_5d=False):
+            calls.append((geometry, features, return_5d))
+            return expected
+
+    Model.bev_pool._turbo_physai_returns_5d = True
+    features = torch.zeros(1, 1, 1, 2, 3, 4)
+    geometry = torch.zeros(1, 1, 1, 2, 3, 3)
+
+    result = reference._bev_pool_5d(Model(), features, geometry)
+    assert result is expected
+    assert len(calls) == 1
+    assert calls[0][0] is geometry
+    assert calls[0][1] is features
+    assert calls[0][2] is True
+
+
 def test_vectorized_samples_accepts_vertex_sequences(monkeypatch):
     pytest.importorskip("shapely")
 

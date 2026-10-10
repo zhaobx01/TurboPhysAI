@@ -620,6 +620,31 @@ class BevPoolFixTest(unittest.TestCase):
 
         torch.testing.assert_close(nchw_out, nhwc_out, rtol=0, atol=0)
 
+    def test_5d_return_preserves_reference_layout(self):
+        import torch as _torch
+
+        bev_pool_fix = _import_bev_pool_fix()
+        self.assertTrue(
+            bev_pool_fix.base_transform_bev_pool._turbo_physai_returns_5d
+        )
+        self_stub = self._make_self()
+        geom_feats, x = self._make_inputs()
+        nchw = _torch.arange(
+            self.B * self.C * self.NX2 * self.NX0 * self.NX1,
+            dtype=_torch.float32,
+        ).reshape(self.B, self.C, self.NX2, self.NX0, self.NX1)
+        expected = nchw.permute(0, 2, 3, 4, 1).contiguous()
+
+        for pooled in (nchw, expected):
+            with self.subTest(layout=tuple(pooled.shape)):
+                with unittest.mock.patch.object(
+                    bev_pool_fix, "_bev_pool", return_value=pooled
+                ):
+                    result = bev_pool_fix.base_transform_bev_pool(
+                        self_stub, geom_feats, x, return_5d=True
+                    )
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
     def test_permute_guard_triggers_only_for_nhwc(self):
         """The permute guard must fire for NHWC (last dim == C) and stay silent
         for NCHW (last dim == nx[1], not C when nx[1] != C)."""

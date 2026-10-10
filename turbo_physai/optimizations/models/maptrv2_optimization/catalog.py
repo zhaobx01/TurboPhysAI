@@ -107,6 +107,28 @@ GRID_MASK = group(
     ),
 )
 
+DATACONTAINER_PIN = group(
+    "maptrv2.datacontainer_pin",
+    wrap(
+        target="torch.utils.data._utils.pin_memory.pin_memory",
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "datacontainer_pin.datacontainer_pin_wrapper"
+        ),
+    ),
+)
+
+FUSED_ADAMW = group(
+    "maptrv2.fused_adamw",
+    wrap(
+        target="projects.mmdet3d_plugin.bevformer.apis.mmdet_train.build_optimizer",
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2_optimization."
+            "optimizer.fused_adamw_builder_wrapper"
+        ),
+    ),
+)
+
 # The reference carries ten compile hooks on baseline symbols listed below.
 # Its eight additional helper hooks are implemented by the
 # ``maptrv2.reference_boundaries`` Group, which replaces the existing callers.
@@ -345,9 +367,11 @@ __all__ = [
     "BEV_POOL_FIX",
     "COMPILE",
     "DATA",
+    "DATACONTAINER_PIN",
     "DATASET_VECTORIZATION",
     "DDP_STATIC_GRAPH",
     "EFFICIENTNET",
+    "FUSED_ADAMW",
     "GRID_MASK",
     "MATCH_COST",
     "PV_MASK",

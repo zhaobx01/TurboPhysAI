@@ -348,6 +348,10 @@ def base_transform_get_geometry_v1(
 
 
 def _bev_pool_5d(self, x, geom_feats):
+    patched_pool = getattr(type(self), "bev_pool", None)
+    if getattr(patched_pool, "_turbo_physai_returns_5d", False):
+        return self.bev_pool(geom_feats, x, return_5d=True)
+
     import torch
     from mmdet3d.ops import bev_pool
 

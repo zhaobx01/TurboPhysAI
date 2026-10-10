@@ -8,16 +8,16 @@ ROCm/HIP bev_pool returns [B, Z, H, W, C] (channels-last) instead of
 therefore receives the wrong axis and produces a misshapen tensor, causing the
 downstream Conv2d to raise a channel-count mismatch.
 
-This replacement is a verbatim copy of BaseTransform.bev_pool with one extra
-guard: after bev_pool() returns, if the last dimension equals self.C the output
-is permuted from [B, Z, H, W, C] to [B, C, Z, H, W] before the collapse step.
+The replacement returns the baseline's collapsed 4D layout by default. The
+reference-boundaries path requests the uncollapsed 5D layout through
+``return_5d=True`` so both Groups use the same pooling implementation.
 """
 
 import torch
 from mmdet3d.ops import bev_pool as _bev_pool
 
 
-def base_transform_bev_pool(self, geom_feats, x):
+def base_transform_bev_pool(self, geom_feats, x, *, return_5d=False):
     B, N, D, H, W, C = x.shape
     Nprime = B * N * D * H * W
 
@@ -49,6 +49,19 @@ def base_transform_bev_pool(self, geom_feats, x):
 
     x = _bev_pool(x, geom_feats, B, self.nx[2], self.nx[0], self.nx[1])
 
+    # The reference boundary keeps Z separate until its compiled down_sample
+    # helper. The standalone replacement retains the baseline's 4D contract.
+    if return_5d:
+        expected_nhwc = (B, int(self.nx[2]), int(self.nx[0]), int(self.nx[1]), C)
+        if tuple(x.shape) == expected_nhwc:
+            return x
+        expected_nchw = (B, C, int(self.nx[2]), int(self.nx[0]), int(self.nx[1]))
+        if tuple(x.shape) == expected_nchw:
+            return x.permute(0, 2, 3, 4, 1).contiguous()
+        raise RuntimeError(
+            f"cannot identify BEV channel dimension in shape {tuple(x.shape)}"
+        )
+
     # ROCm/HIP bev_pool may return [B, Z, H, W, C] instead of [B, C, Z, H, W]
     if x.dim() == 5 and x.shape[-1] == self.C:
         x = x.permute(0, 4, 1, 2, 3).contiguous()
@@ -56,3 +69,9 @@ def base_transform_bev_pool(self, geom_feats, x):
     # collapse Z
     final = torch.cat(x.unbind(dim=2), 1)
     return final
+
+
+# BaseTransform.forward can ask this replacement for the 5D layout when the
+# reference boundaries Group is active. Other bev_pool implementations fall
+# back to reference._bev_pool_5d.
+base_transform_bev_pool._turbo_physai_returns_5d = True

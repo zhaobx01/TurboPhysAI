@@ -284,12 +284,12 @@ BaseTransform.forward(images, img_metas)
   ├─ self.get_geometry_v1(...)     ← B6.1
   ├─ self.get_mlp_input(...)
   ├─ self.get_cam_feats(...)
-  └─ _bev_pool_5d(...)             ← 附带的布局防御，见下
+  └─ _bev_pool_5d(...)             ← 优先调用已替换的 self.bev_pool，见下
 ```
 
 **为什么单独拆出来**：这段是 Python `for` 循环加 numpy↔tensor 转换，numpy 交互必然触发 graph break，本身就不适合进编译图；拆成独立 helper 后，至少能单独决定它是否编译，不拖累调用它的 `forward` 主体。
 
-**附带的 ROCm 防御**：这条路径内部的 `_bev_pool_5d` 对 `bev_pool` 输出做一次形状识别——NHWC `[B,Z,H,W,C]` 和 NCHW `[B,C,Z,H,W]` 两种都认，统一转成 NHWC 返回。这是**独立于** `maptrv2.bev_pool_fix`（另一条 ROCm layout 修正，见 §3.7.1/U3）的第二道防线，只作用于 `reference_boundaries` 这条调用路径，两者互不覆盖。
+**附带的 ROCm 防御**：`_bev_pool_5d` 在 `maptrv2.bev_pool_fix` 已安装时调用已替换的 `self.bev_pool(..., return_5d=True)`；该方法兼容 NHWC `[B,Z,H,W,C]` 与 NCHW `[B,C,Z,H,W]` 输出。未安装 `bev_pool_fix` 时，`_bev_pool_5d` 使用自身的 5D 兼容实现。
 
 ##### B6.3 `LSSTransform.forward` → `down_sample`
 
@@ -1440,14 +1440,14 @@ turbo-physai run \
 | NUMA rank 绑定 | B12 | 已映射到 RuntimeConfig `process.numa` |
 | `set_float32_matmul_precision("high")` | B13 | 已接入 `maptrv2.training` |
 | head 中 `get_label_result`、`pad_to_static_list` 抽取 | B8、§4.13 | **已接入**：两者都在 `assigner.py` 中实现（而不是作为 head 的新方法），由 `maptrv2.assigner` 的 `loss` / `_get_target_single` 替换在内部调用 |
-| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5/B6.3、§4.12 | **已接入，但当前配置下 `bev_pool_fix` 被旁路**：ROCm `bev_pool` 返回 `[B,Z,H,W,C]` 而非 CUDA 的 `[B,C,Z,H,W]`，会让后续 `downsample` Conv2d channel 维不匹配崩溃。`maptrv2.bev_pool_fix` 在 monkey-patch 层修正 layout 并顺带做了参考的 `index_select`→`x[kept]` 布尔掩码替换。`down_sample` 的 collapse-Z+downsample 合并通过 `maptrv2.reference_boundaries` 的 `LSSTransform.forward`/`BaseTransform.forward` 包装接入（见 B6.3），现在 `enabled: true`。**两者是同一段逻辑的两个实现，而 `reference_boundaries` 的 `base_transform_forward` 直接调 `_bev_pool_5d`、不再走 `self.bev_pool`，所以 Group 全开时 `bev_pool_fix` 在主训练路径上是死代码**（它仍是 `reference_boundaries` 关闭时的兜底）。详见 §3.8 |
+| encoder/BEV 路径中的 `bev_pool` 返回契约和 `down_sample` 合并 | B5/B6.3、§4.12 | **已接入**：`maptrv2.bev_pool_fix` 修正 layout 并实现参考的布尔掩码索引；`reference_boundaries` 的 `BaseTransform.forward` 在该 Group 已安装时调用 `self.bev_pool(..., return_5d=True)`，再由编译的 `down_sample` 折叠 Z 轴。单独启用 `bev_pool_fix` 时仍返回基线的 4D 布局。详见 §3.8 |
 | `lightop` DCU Deformable Attention 算子替换 | B14、K4 | **已接入**：`extends: framework.mmcv.hcu` 引入 `mmcv.msda`，它替换 `mmcv._ext` 的函数符号；插件的 `ext_module` 就是 `mmcv._ext` 本体，替换直接传到调用点。参考的 `except ImportError` 由 `runtime_condition` 探针等价实现 |
 
 #### 3.6.2 `mmdetection3d` 与部署层
 
 | 参考实现改动 | 当前处理 |
 | --- | --- |
-| `mmdet3d.ops.bev_pool.bev_pool` 去掉尾部 `permute(0,4,1,2,3)` | **在运行时已经生效，但来源不是本包**：当前安装的 mmdet3d wheel 由参考树构建，其 `bev_pool.py:96` 已经是注释态并 `return x`（5D）（见 §3.8.1）。package 侧对应的是 `maptrv2.bev_pool_fix`（默认开启）与 `maptrv2.reference_boundaries` 的 `_bev_pool_5d`，两者都按 5D 处理；`common.hcu.base` 那条通用 `mmdet3d.bev_pool` group 当前未接线 |
+| `mmdet3d.ops.bev_pool.bev_pool` 去掉尾部 `permute(0,4,1,2,3)` | 参考环境安装的 mmdet3d wheel 由参考树构建，其 `bev_pool.py:96` 已经是注释态并 `return x`（5D）（见 §3.8.1）。本包的 `bev_pool_fix` 兼容原始与参考 wheel 的输出布局；`reference_boundaries` 请求 5D，单独启用 `bev_pool_fix` 时返回 4D。服务器上应核对实际导入的 wheel |
 | SparseConv 系列全部 `register_module(force=True)` | **已接入** `maptrv2.spconv_registry`（registry_override）；但当前运行时 mmdet3d wheel 本身已带 `force=True`，实际是空操作，见 §3.7.1 U8 |
 | 多个 point ops 去掉 `THC/THC.h`、改用 `ATen/cuda/CUDAContext.h` | **已接入**：`build.py` 的 `_point_op_patches()` 补 `#include <ATen/cuda/CUDAContext.h>`；属构建层，不做成 Group |
 | `__CUDA_ARCH__` → `__CUDACC__`、C++14 → C++17 | **已接入**：`build.py` 的 `_build_compatibility_patches()` 覆盖这两项；属构建层 |
@@ -1496,10 +1496,10 @@ turbo-physai run \
                              torch.compile 由 TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE 控制，
                              默认 "0"（不编译），且参考的 cudagraphs 选项未复刻
 
-MapTRv2 专属优化（11 个 group 全部 enabled: true）
+MapTRv2 专属优化（13 个 group 全部 enabled: true）
 ├── training / data / grid_mask / match_cost / pv_mask / efficientnet  生效
 ├── spconv_registry                                                  生效但当前冗余（wheel 已有 force=True）
-├── bev_pool_fix                                                     生效但被 reference_boundaries 旁路
+├── bev_pool_fix                                                     全开时向 reference_boundaries 提供 5D BEV
 ├── compile / reference_boundaries                                   生效
 ├── assigner                                                         静态化生效，assign 编译不生效
 └── ddp_static_graph                                                 生效（需与 assigner 配对）
@@ -1516,9 +1516,10 @@ mmdet3d 与部署层
                  __CUDACC__ / c++17 / GDK setup.py "if 1:"，不含上面那条 .cu 改动
 ```
 
-因此当前的说法应该是：**13 个 `maptrv2.*` group 全部已接入并处于启用状态，但其中两项
-（`spconv_registry`、`bev_pool_fix`）在当前运行时环境下分别表现为冗余和被旁路；
-真正的缺口集中在数据集向量化第二梯队和一条 GDK 内核补丁上。**
+因此当前的说法应该是：**13 个 `maptrv2.*` group 全部已接入并处于启用状态；
+`spconv_registry` 在参考 wheel 已注册同名算子时可能冗余，`bev_pool_fix` 在全开配置下
+向 `reference_boundaries` 提供 5D BEV。真正的缺口集中在数据集向量化第二梯队和一条
+GDK 内核补丁上。**
 7 个框架层 group 里只有 `mmcv.msda` 接了线（`framework.mmcv.hcu`），另外 6 个不是"接入了但没生效"，
 而是 `extends` 没指向 `common.hcu.base`。
 
@@ -1535,8 +1536,8 @@ mmdet3d 与部署层
 
 - **已接入并启用**：`maptrv2.compile` 的 10 个同名目标、`maptrv2.reference_boundaries` 的 8 个新增
   Helper 挂点（见 B6）、`maptrv2.assigner` 的静态契约（U4）、`maptrv2.ddp_static_graph`（U7）。
-- **已接入但当前不生效**：`maptrv2.assigner` 内 `assign` 的 `torch.compile`（U4）、
-  `maptrv2.spconv_registry`（U8）、`maptrv2.bev_pool_fix` 的主路径（U3）。
+- **已接入但当前不生效**：`maptrv2.assigner` 内 `assign` 的 `torch.compile`（U4）；
+  `maptrv2.spconv_registry` 在参考 wheel 已注册同名算子时可能冗余（U8）。
 - **未接入**：`_interpolate_line_points_vectorized` 及其 7 个调用点（U6 剩余部分）、GDK `.cu` 补丁（K3）。
 - **已有等价替代**：`TransposeImage` 的输入布局处理（L2）。
 
@@ -1640,12 +1641,11 @@ final = torch.cat(x.unbind(dim=2), 1)
 `x = x[kept]` / `geom_feats = geom_feats[kept]` 的改动（`bev_pool_fix.py:47-48`），
 所以它并不是"只加了一个 permute 判断"。
 
-**当前配置下的实际归属**：参考实现的「把 collapse Z 移入新 `down_sample` 并统一编译」优化
-由 `maptrv2.reference_boundaries` 的 `BaseTransform.forward` / `LSSTransform.forward` 包装承担
-（见 B6.3），而 `reference.py` 的 `base_transform_forward` 直接调 `_bev_pool_5d(self, features, geometry)`，
-**不再经过 `self.bev_pool`**。因此当两个 group 都开启（当前就是）时，本节的 `bev_pool_fix`
-在主训练路径上不会被调用——它是 `reference_boundaries` 关闭时的兜底，不是叠加生效的第二层。
-两者是同一段逻辑的两个实现，不要理解为互补。
+**当前配置下的实际归属**：`maptrv2.reference_boundaries` 把 collapse Z 移入编译的
+`down_sample`（见 B6.3）。它的 `_bev_pool_5d` 在 `maptrv2.bev_pool_fix` 已安装时调用
+`self.bev_pool(..., return_5d=True)`，由该替换提供未折叠的 5D BEV；未安装时走
+`_bev_pool_5d` 自身的兼容实现。只开启 `bev_pool_fix` 时，`self.bev_pool` 默认返回
+基线所需的 4D BEV。
 
 **启动方式**（须先设置 PYTHONPATH，再通过 TurboPhysAI 包裹启动）：
 
@@ -2081,7 +2081,6 @@ class TransposeImage:
 
 已接入但当前不生效
 ├── maptrv2.assigner 内 assign 的 torch.compile（TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE 默认 0）
-├── maptrv2.bev_pool_fix 的主路径（被 reference_boundaries 旁路）
 └── 6 个 mmdet3d.* 框架层 group（extends 未指向 common.hcu.base）
 
 未接入
@@ -2094,8 +2093,8 @@ class TransposeImage:
 
 因此当前最需要继续处理的是 **U6 里剩下的 `_interpolate_line_points_vectorized` 及 7 个调用点**；
 `mmcv.msda`（lightop 后端）已通过 `extends: framework.mmcv.hcu` 接入，缺 lightop 时自动回退到
-mmcv 算子；GDK 的 `.cu` 补丁只在重建扩展时需要；`spconv_registry` 与 `bev_pool_fix` 不是缺口，
-但在当前环境下分别是冗余和被旁路，启用配置时要知道它们没有叠加效果。
+mmcv 算子；GDK 的 `.cu` 补丁只在重建扩展时需要；`spconv_registry` 在参考 wheel
+已注册同名算子时可能冗余，`bev_pool_fix` 在全开配置下向 `reference_boundaries` 提供 5D BEV。
 
 10 个同名 `compile` 挂点、8 个新增 Helper 挂点和 `maptrv2.ddp_static_graph` 已经由配置启用，
 不需要再改接入代码，剩下的是在目标机型完成 A/B 观察。`ddp_static_graph` 上机时要注意两点：
@@ -2153,7 +2152,7 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 | **数据集向量化第二梯队**（`_interpolate_line_points_vectorized`、`shift_fixed_num_sampled_points_v2` 缓存） | **未接入**（U6） |
 | DDP `ddp_static_graph=True` + `find_unused_parameters=False` | 已接入（`maptrv2.ddp_static_graph`，U7）；基线 `mmdet_train.py` 没有该字段，所以改在 DDP 构造点注入 |
 | **GDK `.cu` 的 `value.scalar_type()`** | **未接入**（K3） |
-| `bev_pool` 三文件协同改造（mmdet3d 去 permute / `bev_pool` return 5D / 编译版 `down_sample`） | 已接入（`maptrv2.reference_boundaries` + `maptrv2.bev_pool_fix`），但两者重叠，见 3.8.3 |
+| `bev_pool` 三文件协同改造（mmdet3d 去 permute / `bev_pool` return 5D / 编译版 `down_sample`） | 已接入（`maptrv2.reference_boundaries` + `maptrv2.bev_pool_fix`）；两组通过 5D 返回约定协作，见 3.8.3 |
 | `SparseConv` / `EfficientNet` `force=True` | 已接入（`spconv_registry` / `efficientnet`） |
 | 构建补丁（`c++17`、`__CUDA_ARCH__`、`mmcv_maximum_version`、numba、ATen include、`if 1:`） | 已由 `build.py` 离线覆盖 |
 | `lightop` MSDeformAttn 后端切换 | 已接入（K4）：`mmcv.msda` 替换 `mmcv._ext` 的函数符号，插件的 `ext_module` 正是该模块本体；参考的 `except ImportError` 由 `runtime_condition` 探针等价实现 |
@@ -2170,21 +2169,21 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 | `grid_mask` | 等价且更稳 | 用 `x.device` 替代参考硬编码的 `.cuda()` |
 | `match_cost` | 一致 | 与参考 `map_loss.py:527` 的广播减法同形 |
 | `pv_mask` | 部分覆盖 | 3 个目标与参考对应实现一致；数据集第二梯队未覆盖（Q1） |
-| `bev_pool_fix` | 正确但重叠 | 含参考的 `x[kept]` 布尔掩码替换 + ROCm layout 修正；**与 `reference_boundaries` 是同一段逻辑的两个实现** |
+| `bev_pool_fix` | 正确 | 含参考的 `x[kept]` 布尔掩码替换 + ROCm layout 修正；全开时向 `reference_boundaries` 提供 5D BEV，单独启用时返回 4D |
 | `assigner` | 正确 | `pad_to_static_list`/`hungarian_match`/`get_target_single` 均在包内实现；差异只在 `assign` 的编译选项 |
 | `spconv_registry` / `efficientnet` | 正确但前者冗余 | 见 U8 |
 
-**重叠的具体后果**：`reference.py:418-447` 的 `base_transform_forward` 直接调用
-`_bev_pool_5d(self, features, geometry)`，**不经过 `self.bev_pool`**。而 `bev_pool_fix` 的
-作用点正是 `BaseTransform.bev_pool`。两个 group 都开启时，主训练路径走的是
-`_bev_pool_5d`，`bev_pool_fix` 不会被调用。它不是"第二层保险"，而是 `reference_boundaries`
-关闭时的替代方案。
+**两组的调用约定**：`reference.py` 的 `base_transform_forward` 调用 `_bev_pool_5d`；
+后者发现 `BaseTransform.bev_pool` 已由 `bev_pool_fix` 替换时，转调
+`self.bev_pool(..., return_5d=True)`。因此全开时主训练路径会执行 `bev_pool_fix`；
+关闭 `reference_boundaries` 后，该方法仍按基线约定返回 4D。若只开启
+`reference_boundaries`，`_bev_pool_5d` 自己完成 5D 布局兼容。
 
 #### 3.8.4 Q3：当前配置下是否都能生效
 
 配置事实（`configs/optimization.yaml` / `recipe.yaml` 核对）：
 
-- 13 个 `maptrv2.*` group 中 12 个 `enabled: true`，`maptrv2.reference_boundaries` 为 `false`。
+- 13 个 `maptrv2.*` group 均为 `enabled: true`，包括 `maptrv2.reference_boundaries`。
 - `recipe.yaml` 的 `extends` 指向 **`framework.mmcv.hcu`**（只有 `mmcv.msda`），不是
   `common.hcu.base`；生成产物的 `optimization_modules` 因此是两行：
   `common.mmcv.catalog` + `maptrv2_optimization.catalog`。
@@ -2200,7 +2199,7 @@ torchrun --nproc-per-node=8 --master-port=6005 --no-python bash -c "$NUMA_SCRIPT
 | `ddp_static_graph` | enabled，env 默认 `"1"` | 生效 | 需与 `assigner` 配对，见 U7 |
 | `assigner` | enabled | 静态化生效，`assign` 编译**不生效** | `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 默认 `"0"` |
 | `spconv_registry` | enabled | **冗余空操作** | 运行时 wheel 已带 `force=True`（3.8.1） |
-| `bev_pool_fix` | enabled | **被旁路** | `reference_boundaries` 抢先接管 `BaseTransform.forward`（3.8.3） |
+| `bev_pool_fix` | enabled | **生效** | `reference_boundaries` 通过 `return_5d=True` 调用该替换（3.8.3） |
 | `mmcv.msda` | enabled（经 `extends: framework.mmcv.hcu`） | 生效 | 缺 lightop 时由 `runtime_condition` 回退到 mmcv 算子 |
 | 6 个 `mmdet3d.*` | **不在配置里** | **不生效** | `extends` 只接了 `framework.mmcv.hcu`，没接 `common.hcu.base`（§2.6） |
 
@@ -2212,25 +2211,24 @@ A（未优化基线）
         └── bev_pool 已 return 5D，所以 B 必须有 bev_pool_fix 才不崩
 
 B（PhysAI 接入层）
-  ├── 12 个 maptrv2.* group 全部 enabled: true
+  ├── 13 个 maptrv2.* group 全部 enabled: true
   ├── 另有 mmcv.msda（extends: framework.mmcv.hcu），对应 C 的 lightop 后端替换
   ├── 与 C 对齐的：19 个编译边界（10 + 8 + assigner）、精度/后端开关、
   │   cdist 替换、PV mask 向量化、bev_pool 契约、注册表覆盖、构建补丁、
   │   DDP 静态图、lightop MSDeformAttn 后端
   ├── 与 C 有差异的：assign 的编译选项（默认不开）
   ├── 与 C 缺口：`_interpolate_line_points_vectorized`、GDK .cu
-  └── 自身重叠/冗余：bev_pool_fix 被 reference_boundaries 旁路、
-      spconv_registry 在已打补丁的 wheel 上空转
+  └── 条件性冗余：spconv_registry 在已打补丁的 wheel 上空转
 
 C（侵入式参考）
   └── 另有 7 个框架层公共优化（mmcv.msda + 6 个 mmdet3d.*）
         B 只接了 framework.mmcv.hcu（mmcv.msda），6 个 mmdet3d.* 未接线
 ```
 
-一句话：**接入的项在语义上都对得上参考实现，主要缺口只剩数据集向量化第二梯队和 GDK 的 `.cu` 补丁；
-需要留意的是三项"接了但当前不产生效果"——`bev_pool_fix`（被旁路）、`spconv_registry`（冗余）、
-`assign` 的编译（默认关闭）——以及 `extends` 没指向 `common.hcu.base`、6 个 `mmdet3d.*`
-框架层 group 未接线。**
+一句话：**主要缺口是数据集向量化第二梯队和 GDK 的 `.cu` 补丁；
+`bev_pool_fix` 与 `reference_boundaries` 已按 5D 返回约定接通。仍需留意
+`spconv_registry` 在参考 wheel 上可能冗余、`assign` 的编译默认关闭，以及
+`extends` 没指向 `common.hcu.base`、6 个 `mmdet3d.*` 框架层 group 未接线。**
 
 ---
 

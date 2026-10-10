@@ -11,7 +11,6 @@ changed existing methods as one atomic Group.
 
 from __future__ import annotations
 
-import copy
 import os
 
 
@@ -347,7 +346,7 @@ def _static_loss_impl(
             f"{self.__class__.__name__} only supports "
             "gt_bboxes_ignore setting to None."
         )
-    gt_vecs_list = copy.deepcopy(gt_bboxes_list)
+    gt_vecs_list = gt_bboxes_list
     all_cls_scores = preds_dicts["all_cls_scores"]
     all_bbox_preds = preds_dicts["all_bbox_preds"]
     all_pts_preds = preds_dicts["all_pts_preds"]
