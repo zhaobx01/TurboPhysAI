@@ -16,7 +16,15 @@ kernel/**/*_hip.h
 kernel/**/*_hip.hpp
 kernel/**/*_hip.cpp
 kernel/**/*_hip.cuh
+kernel/**/*_hip.cc
 kernel/**/*.bak
 kernel/**/*.orig
 kernel/**/*.rej
 kernel/**/*~
+
+# compiled native extension (python setup.py bdist_wheel)
+*.so
+
+# generated from a clean model/MapTrv2 checkout via `optimization generate`;
+# never hand-write or commit this, see maptrv2_optimization/README.md
+turbo_physai/optimizations/models/maptrv2_optimization/configs/optimization.yaml
