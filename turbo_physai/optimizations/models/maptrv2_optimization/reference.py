@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 
+from .bev_pool_fix import normalize_bev_pool_layout
+
 
 _COMPILED = {}
 _ACTIVE_MODE = None
@@ -388,28 +390,8 @@ def _bev_pool_5d(self, x, geom_feats):
         self.nx[0],
         self.nx[1],
     )
-    if output.dim() != 5:
-        raise RuntimeError("MapTRv2 reference BEV pooling must return 5D")
-    expected_nhwc = (
-        batch,
-        int(self.nx[2]),
-        int(self.nx[0]),
-        int(self.nx[1]),
-        self.C,
-    )
-    if tuple(output.shape) == expected_nhwc:
-        return output
-    expected_nchw = (
-        batch,
-        self.C,
-        int(self.nx[2]),
-        int(self.nx[0]),
-        int(self.nx[1]),
-    )
-    if tuple(output.shape) == expected_nchw:
-        return output.permute(0, 2, 3, 4, 1).contiguous()
-    raise RuntimeError(
-        f"cannot identify BEV channel dimension in shape {tuple(output.shape)}"
+    return normalize_bev_pool_layout(
+        output, batch, channels, self.nx, channels_last=True
     )
 
 

@@ -11,13 +11,45 @@ downstream Conv2d to raise a channel-count mismatch.
 The replacement returns the baseline's collapsed 4D layout by default. The
 reference-boundaries path requests the uncollapsed 5D layout through
 ``return_5d=True`` so both Groups use the same pooling implementation.
+
+Torch and the native pooling operator are loaded only when pooling is called.
 """
 
-import torch
-from mmdet3d.ops import bev_pool as _bev_pool
+
+def normalize_bev_pool_layout(output, batch, channels, nx, *, channels_last):
+    """Validate and normalize the two supported 5D BEV pooling layouts."""
+    depth, height, width = int(nx[2]), int(nx[0]), int(nx[1])
+    expected_nchw = (batch, channels, depth, height, width)
+    expected_nhwc = (batch, depth, height, width, channels)
+    shape = tuple(output.shape)
+    is_nchw = shape == expected_nchw
+    is_nhwc = shape == expected_nhwc
+    if is_nchw and is_nhwc:
+        raise RuntimeError(
+            f"ambiguous BEV pooling layout for shape {shape}: "
+            "both [B,C,Z,H,W] and [B,Z,H,W,C] match"
+        )
+    if not (is_nchw or is_nhwc):
+        raise RuntimeError(
+            f"invalid BEV pooling shape {shape}: expected "
+            f"[B,C,Z,H,W]={expected_nchw} or [B,Z,H,W,C]={expected_nhwc}"
+        )
+    if channels_last and is_nchw:
+        return output.permute(0, 2, 3, 4, 1).contiguous()
+    if not channels_last and is_nhwc:
+        return output.permute(0, 4, 1, 2, 3).contiguous()
+    return output
+
+
+def _bev_pool(*args):
+    from mmdet3d.ops import bev_pool
+
+    return bev_pool(*args)
 
 
 def base_transform_bev_pool(self, geom_feats, x, *, return_5d=False):
+    import torch
+
     B, N, D, H, W, C = x.shape
     Nprime = B * N * D * H * W
 
@@ -51,20 +83,9 @@ def base_transform_bev_pool(self, geom_feats, x, *, return_5d=False):
 
     # The reference boundary keeps Z separate until its compiled down_sample
     # helper. The standalone replacement retains the baseline's 4D contract.
+    x = normalize_bev_pool_layout(x, B, C, self.nx, channels_last=return_5d)
     if return_5d:
-        expected_nhwc = (B, int(self.nx[2]), int(self.nx[0]), int(self.nx[1]), C)
-        if tuple(x.shape) == expected_nhwc:
-            return x
-        expected_nchw = (B, C, int(self.nx[2]), int(self.nx[0]), int(self.nx[1]))
-        if tuple(x.shape) == expected_nchw:
-            return x.permute(0, 2, 3, 4, 1).contiguous()
-        raise RuntimeError(
-            f"cannot identify BEV channel dimension in shape {tuple(x.shape)}"
-        )
-
-    # ROCm/HIP bev_pool may return [B, Z, H, W, C] instead of [B, C, Z, H, W]
-    if x.dim() == 5 and x.shape[-1] == self.C:
-        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
 
     # collapse Z
     final = torch.cat(x.unbind(dim=2), 1)
