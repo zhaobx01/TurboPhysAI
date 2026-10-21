@@ -1,0 +1,83 @@
+# Copyright 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: BSD-3-Clause
+
+schema_version: turbophysai/optimization-config/v1
+kind: OptimizationConfig
+
+metadata:
+  id: model.maptrv2.development.hcu
+  version: "0.1.0"
+  description: MapTRv2 HCU optimization recipe (validated reference port)
+
+model:
+  name: maptrv2
+
+optimization_modules:
+  - turbo_physai.optimizations.models.maptrv2.catalog
+
+# The reference implementation swaps MSDeformAttn's ``ext_module`` for LightOp.
+# ``framework.mmcv.hcu`` carries exactly that one Group (``mmcv.msda``) plus the
+# module that declares it; it is deliberately not ``common.hcu.base``, which
+# would also pull in the six ``mmdet3d.*`` Groups that have no counterpart in
+# the MapTRv2 reference.
+extends:
+  - framework.mmcv.hcu
+
+compatibility: {}
+
+optimization_groups:
+  # Training runtime: channels-last, cuDNN benchmark, fork workers.
+  - id: maptrv2.training
+    enabled: true
+  # DataLoader pin_memory=True.
+  - id: maptrv2.data
+    enabled: true
+  # v4/v3 additions remain opt-in pending target-HCU performance/accuracy runs.
+  - id: maptrv2.datacontainer_pin
+    enabled: true
+  - id: maptrv2.fused_adamw
+    enabled: true
+  # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
+  - id: maptrv2.bev_pool_fix
+    enabled: true
+  # Dynamo-safe GridMask.
+  - id: maptrv2.grid_mask
+    enabled: true
+  # cdist(p=1) -> broadcast subtraction.
+  - id: maptrv2.match_cost
+    enabled: true
+  # Vectorized PV-mask resampling plus the merged BEV-mask affine transform.
+  - id: maptrv2.pv_mask
+    enabled: true
+  # Arc-length resampling for shift_fixed_num_sampled_points_v2 (the pattern
+  # selected by gt_shift_pts_pattern='v2').
+  - id: maptrv2.dataset_vectorization
+    enabled: true
+  # EfficientNet may override an already registered backbone entry.
+  - id: maptrv2.efficientnet
+    enabled: true
+  # The vendored mmdet3d SparseConv classes may be pre-registered by an image.
+  - id: maptrv2.spconv_registry
+    enabled: true
+  # torch.compile on the extracted pure-tensor hot methods. Enable after the
+  # accuracy/throughput A/B on the target machine.
+  - id: maptrv2.compile
+    enabled: true
+  # Complete static assignment contract plus Dynamo-isolated Hungarian solver.
+  - id: maptrv2.assigner
+    enabled: true
+  # v5 A1: remove redundant Boolean-mask cleanup; A2: keep normalization on device.
+  - id: maptrv2.sync_elimination
+    enabled: true
+  # Eight reference helper boundaries and the reference 5D BEV layout.
+  - id: maptrv2.reference_boundaries
+    enabled: true
+  # static_graph=True + find_unused_parameters=False on the DDP constructor.
+  # Keep this paired with maptrv2.assigner: the static graph assumes a fixed
+  # autograd graph, which pad_to_static_list provides.
+  - id: maptrv2.ddp_static_graph
+    enabled: true
+  # Inherited from framework.mmcv.hcu; overridden here so the whole recipe can
+  # be switched off in one place.
+  - id: mmcv.msda
+    enabled: true
