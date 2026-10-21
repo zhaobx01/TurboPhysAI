@@ -645,6 +645,73 @@ class BevPoolFixTest(unittest.TestCase):
                     )
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
+    def test_equal_width_and_channels_preserves_values_and_gradients(self):
+        bev_pool_fix = _import_bev_pool_fix()
+        batch, channels, depth, height, width = 2, 4, 2, 3, 4
+        owner = types.SimpleNamespace(
+            C=channels, nx=torch.tensor([height, width, depth]),
+            bx=torch.zeros(3), dx=torch.ones(3),
+        )
+        features = torch.zeros(batch, 1, 1, 1, 1, channels)
+        geometry = torch.zeros(batch, 1, 1, 1, 1, 3)
+        values = torch.arange(
+            batch * channels * depth * height * width, dtype=torch.float32
+        ).reshape(batch, channels, depth, height, width)
+
+        for channels_last in (False, True):
+            for return_5d in (False, True):
+                with self.subTest(channels_last=channels_last, return_5d=return_5d):
+                    source = values.clone().requires_grad_()
+                    pooled = (source.permute(0, 2, 3, 4, 1).contiguous()
+                              if channels_last else source)
+                    with unittest.mock.patch.object(
+                        bev_pool_fix, "_bev_pool", return_value=pooled
+                    ):
+                        result = bev_pool_fix.base_transform_bev_pool(
+                            owner, geometry, features, return_5d=return_5d
+                        )
+                    if return_5d:
+                        expected = values.permute(0, 2, 3, 4, 1)
+                    else:
+                        expected = values.permute(0, 2, 1, 3, 4).reshape(
+                            batch, depth * channels, height, width
+                        )
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    weights = torch.arange(
+                        1, result.numel() + 1, dtype=result.dtype
+                    ).reshape(result.shape)
+                    (result * weights).sum().backward()
+                    expected_grad = (
+                        weights.permute(0, 4, 1, 2, 3) if return_5d else
+                        weights.reshape(batch, depth, channels, height, width)
+                        .permute(0, 2, 1, 3, 4)
+                    )
+                    torch.testing.assert_close(source.grad, expected_grad, rtol=0, atol=0)
+
+    def test_ambiguous_and_invalid_pool_layouts_are_rejected(self):
+        bev_pool_fix = _import_bev_pool_fix()
+        owner = types.SimpleNamespace(
+            C=2, nx=torch.tensor([2, 2, 2]),
+            bx=torch.zeros(3), dx=torch.ones(3),
+        )
+        features = torch.zeros(1, 1, 1, 1, 1, 2)
+        geometry = torch.zeros(1, 1, 1, 1, 1, 3)
+        cases = (
+            (torch.arange(16.).reshape(1, 2, 2, 2, 2), "ambiguous BEV pooling layout"),
+            (torch.zeros(1, 2, 2, 2), "invalid BEV pooling shape"),
+            (torch.zeros(1, 2, 2, 2, 3), "invalid BEV pooling shape"),
+        )
+        for pooled, message in cases:
+            for return_5d in (False, True):
+                with self.subTest(shape=tuple(pooled.shape), return_5d=return_5d):
+                    with unittest.mock.patch.object(
+                        bev_pool_fix, "_bev_pool", return_value=pooled
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            bev_pool_fix.base_transform_bev_pool(
+                                owner, geometry, features, return_5d=return_5d
+                            )
+
     def test_permute_guard_triggers_only_for_nhwc(self):
         """The permute guard must fire for NHWC (last dim == C) and stay silent
         for NCHW (last dim == nx[1], not C when nx[1] != C)."""

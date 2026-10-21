@@ -171,6 +171,34 @@ MATCH_COST = group(
     ),
 )
 
+SYNC_ELIMINATION = group(
+    "maptrv2.sync_elimination",
+    replace(
+        target=("projects.mmdet3d_plugin.maptr.dense_heads.maptrv2_head."
+                "MapTRv2Head.loss_single"),
+        replacement=("turbo_physai.optimizations.models.maptrv2_optimization."
+                     "sync_elimination.maptrv2_head_loss_single"),
+    ),
+    replace(
+        target=("projects.mmdet3d_plugin.maptr.dense_heads.maptr_head."
+                "MapTRHead.loss_single"),
+        replacement=("turbo_physai.optimizations.models.maptrv2_optimization."
+                     "sync_elimination.maptr_head_loss_single"),
+    ),
+    replace(
+        target=("projects.mmdet3d_plugin.bevformer.dense_heads.bevformer_head."
+                "BEVFormerHead.loss_single"),
+        replacement=("turbo_physai.optimizations.models.maptrv2_optimization."
+                     "sync_elimination.bevformer_head_loss_single"),
+    ),
+    replace(
+        target=("projects.mmdet3d_plugin.bevformer.modules.encoder."
+                "BEVFormerEncoder.point_sampling"),
+        replacement=("turbo_physai.optimizations.models.maptrv2_optimization."
+                     "sync_elimination.bevformer_point_sampling"),
+    ),
+)
+
 PV_MASK = group(
     "maptrv2.pv_mask",
     replace(
@@ -377,5 +405,6 @@ __all__ = [
     "PV_MASK",
     "REFERENCE_BOUNDARIES",
     "SPARSE_CONV_REGISTRY",
+    "SYNC_ELIMINATION",
     "TRAINING",
 ]

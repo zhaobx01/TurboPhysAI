@@ -66,6 +66,9 @@ optimization_groups:
   # Complete static assignment contract plus Dynamo-isolated Hungarian solver.
   - id: maptrv2.assigner
     enabled: true
+  # v5 A1: remove redundant Boolean-mask cleanup; A2: keep normalization on device.
+  - id: maptrv2.sync_elimination
+    enabled: true
   # Eight reference helper boundaries and the reference 5D BEV layout.
   - id: maptrv2.reference_boundaries
     enabled: true

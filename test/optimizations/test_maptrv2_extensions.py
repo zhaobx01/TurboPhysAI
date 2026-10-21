@@ -576,6 +576,69 @@ def test_reference_bev_pool_uses_installed_fix():
     assert calls[0][2] is True
 
 
+@pytest.mark.parametrize("installed_fix", [False, True])
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_reference_pool_layout_values_and_gradients(monkeypatch, installed_fix, channels_last):
+    from turbo_physai.optimizations.models.maptrv2_optimization import reference
+
+    batch, channels, depth, height, width = 2, 4, 2, 3, 4
+    source = torch.arange(
+        batch * channels * depth * height * width, dtype=torch.float32
+    ).reshape(batch, channels, depth, height, width).requires_grad_()
+    pooled = source.permute(0, 2, 3, 4, 1).contiguous() if channels_last else source
+    model, features, geometry = _reference_pool_case(
+        monkeypatch, pooled, channels, (height, width, depth), installed_fix
+    )
+    result = reference._bev_pool_5d(model, features, geometry)
+    torch.testing.assert_close(result, source.detach().permute(0, 2, 3, 4, 1),
+                               rtol=0, atol=0)
+    if channels_last:
+        assert result is pooled
+    weights = torch.arange(1, result.numel() + 1, dtype=result.dtype).reshape(result.shape)
+    (result * weights).sum().backward()
+    torch.testing.assert_close(source.grad, weights.permute(0, 4, 1, 2, 3), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("installed_fix", [False, True])
+@pytest.mark.parametrize("shape,message", [
+    ((1, 2, 2, 2, 2), "ambiguous BEV pooling layout"),
+    ((1, 2, 2, 2), "invalid BEV pooling shape"),
+    ((1, 2, 2, 2, 3), "invalid BEV pooling shape"),
+])
+def test_reference_pool_rejects_unidentifiable_layouts(monkeypatch, installed_fix, shape, message):
+    from turbo_physai.optimizations.models.maptrv2_optimization import reference
+
+    pooled = torch.arange(float(np.prod(shape))).reshape(shape)
+    model, features, geometry = _reference_pool_case(
+        monkeypatch, pooled, 2, (2, 2, 2), installed_fix
+    )
+    with pytest.raises(RuntimeError, match=message):
+        reference._bev_pool_5d(model, features, geometry)
+
+
+def _reference_pool_case(monkeypatch, pooled, channels, grid, installed_fix):
+    ops = types.ModuleType("mmdet3d.ops")
+    ops.bev_pool = lambda *args: pooled
+    monkeypatch.setitem(sys.modules, "mmdet3d.ops", ops)
+
+    class Model:
+        pass
+
+    if installed_fix:
+        from turbo_physai.optimizations.models.maptrv2_optimization import bev_pool_fix
+
+        monkeypatch.setattr(bev_pool_fix, "_bev_pool", ops.bev_pool)
+        Model.bev_pool = bev_pool_fix.base_transform_bev_pool
+    model = Model()
+    model.C = channels
+    model.nx = torch.tensor(grid)
+    model.bx, model.dx = torch.zeros(3), torch.ones(3)
+    batch = pooled.shape[0]
+    features = torch.zeros(batch, 1, 1, 1, 1, channels)
+    geometry = torch.zeros(batch, 1, 1, 1, 1, 3)
+    return model, features, geometry
+
+
 def test_vectorized_samples_accepts_vertex_sequences(monkeypatch):
     pytest.importorskip("shapely")
 

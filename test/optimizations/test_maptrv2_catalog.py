@@ -28,6 +28,7 @@ EXPECTED_GROUPS = {
     "maptrv2.match_cost": Mechanism.REPLACE,
     "maptrv2.pv_mask": Mechanism.REPLACE,
     "maptrv2.assigner": Mechanism.REPLACE,
+    "maptrv2.sync_elimination": Mechanism.REPLACE,
     "maptrv2.efficientnet": Mechanism.REGISTRY_OVERRIDE,
     "maptrv2.spconv_registry": Mechanism.REGISTRY_OVERRIDE,
     "maptrv2.bev_pool_fix": Mechanism.REPLACE,
@@ -136,7 +137,7 @@ class CatalogTest(unittest.TestCase):
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
                 "DATACONTAINER_PIN", "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
                 "FUSED_ADAMW", "GRID_MASK", "MATCH_COST", "PV_MASK",
-                "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "TRAINING",
+                "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "SYNC_ELIMINATION", "TRAINING",
             ],
         )
         for group_id in EXPECTED_GROUPS:
@@ -310,6 +311,29 @@ class CatalogTest(unittest.TestCase):
             0,
             completed.stderr.decode("utf-8", "replace"),
         )
+
+    def test_bev_helpers_import_without_model_dependencies(self):
+        script = (
+            "import sys;"
+            "sys.modules['torch'] = None;"
+            "sys.modules['mmdet3d'] = None;"
+            "from turbo_physai.optimizations.models.maptrv2_optimization "
+            "import bev_pool_fix, reference;"
+            "assert callable(bev_pool_fix.normalize_bev_pool_layout);"
+            "assert reference.normalize_bev_pool_layout "
+            "is bev_pool_fix.normalize_bev_pool_layout;"
+            "assert sys.modules['torch'] is None;"
+            "assert sys.modules['mmdet3d'] is None"
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(REPO_ROOT)] + [entry for entry in sys.path if entry])
+        completed = subprocess.run(
+            [sys.executable, "-c", script], cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+        )
+        self.assertEqual(completed.returncode, 0,
+                         completed.stderr.decode("utf-8", "replace"))
 
     def test_mechanism_per_group(self):
         for group_id, mechanism in EXPECTED_GROUPS.items():

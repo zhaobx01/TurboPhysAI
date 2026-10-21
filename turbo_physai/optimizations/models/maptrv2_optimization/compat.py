@@ -7,8 +7,8 @@
 are called with the arguments of the wrapped call and must return ``bool``.
 A condition that returns ``False`` selects the unmodified upstream callable.
 
-Every probe imports its dependency lazily, so planning and checking never load
-Torch.
+Dependencies are imported lazily. Catalog discovery does not load Torch;
+selected compatibility checks and runtime probes may load it.
 """
 
 from __future__ import annotations
