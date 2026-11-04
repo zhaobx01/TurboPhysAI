@@ -53,9 +53,26 @@ def pv_mask_sampling_enabled(*_args, **_kwargs) -> bool:
     return os.getenv("TURBO_PHYSAI_DISABLE_PV_MASK", "0") != "1"
 
 
+def shapely_query_returns_indices(*_args, **_kwargs) -> bool:
+    """Return ``True`` when ``STRtree.query`` yields indices (Shapely >= 2)."""
+
+    if os.getenv("TURBO_PHYSAI_DISABLE_EVAL_COMPAT", "0") == "1":
+        return False
+    try:
+        import shapely
+    except Exception:
+        return False
+    try:
+        major = int(str(shapely.__version__).split(".", 1)[0])
+    except (AttributeError, ValueError):
+        return False
+    return major >= 2
+
+
 __all__ = [
     "dynamo_available",
     "pv_mask_sampling_enabled",
+    "shapely_query_returns_indices",
     "static_assigner_available",
     "torch_compile_available",
 ]

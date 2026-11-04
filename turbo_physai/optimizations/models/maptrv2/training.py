@@ -133,3 +133,57 @@ def training_runtime_wrapper(original, options):
         return original(model, dataset, cfg, *args, **kwargs)
 
     return wrapped
+
+
+def init_dist_fork_wrapper(original, options):
+    """Default the start method to ``fork`` before ``init_dist`` picks ``spawn``.
+
+    ``mmcv.runner.init_dist`` sets ``spawn`` when no start method exists yet.
+    ``tools/test.py`` never reaches ``custom_train_detector``, so its evaluation
+    ``Pool`` workers would re-import modules without the TurboPhysAI patches.
+    The start method is only set while it is still unset: a value chosen by the
+    user or an earlier caller is kept.
+    """
+
+    options = dict(options)
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        if _option_flag(options, "fork_start_method",
+                        "TURBO_PHYSAI_FORK_START_METHOD", True):
+            import torch
+
+            start_method = str(
+                options.get(
+                    "start_method",
+                    os.getenv("TURBO_PHYSAI_DATALOADER_START_METHOD", "fork"),
+                )
+            )
+            if start_method and torch.multiprocessing.get_start_method(
+                    allow_none=True) is None:
+                torch.multiprocessing.set_start_method(start_method)
+        return original(*args, **kwargs)
+
+    return wrapped
+
+
+def ddp_forward_compat_wrapper(original, options):
+    """Support MMCV's DDP forward on newer PyTorch versions.
+
+    ``MMDistributedDataParallel._run_ddp_forward`` in MMCV 1.6 reads
+    ``self._use_replicated_tensor_module``, an attribute that newer Torch DDP
+    no longer defines. Training bypasses it through ``train_step``, but the
+    evaluation hook calls ``model(return_loss=False, ...)``, which reaches it
+    and raises ``AttributeError``. Defaulting the attribute to ``False`` makes
+    MMCV pick ``self.module``.
+    """
+
+    del options
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        if not hasattr(self, "_use_replicated_tensor_module"):
+            self._use_replicated_tensor_module = False
+        return original(self, *args, **kwargs)
+
+    return wrapped

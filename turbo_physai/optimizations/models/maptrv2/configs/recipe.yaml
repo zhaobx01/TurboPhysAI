@@ -77,6 +77,9 @@ optimization_groups:
   # autograd graph, which pad_to_static_list provides.
   - id: maptrv2.ddp_static_graph
     enabled: true
+  # Validation: Shapely 2 STRtree.query returns indices, not geometries.
+  - id: maptrv2.eval_compat
+    enabled: true
   # Inherited from framework.mmcv.hcu; overridden here so the whole recipe can
   # be switched off in one place.
   - id: mmcv.msda

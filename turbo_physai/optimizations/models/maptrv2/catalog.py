@@ -39,10 +39,14 @@ Group                                        Reference change
 ``maptrv2.ddp_static_graph``                 ``static_graph=True`` and
                                              ``find_unused_parameters=False``
                                              on ``MMDistributedDataParallel``
+``maptrv2.eval_compat``                      chamfer evaluation tolerates the
+                                             index array returned by Shapely 2
+                                             ``STRtree.query``
 ===========================================  ==================================
 
 ``maptrv2.training`` also pins the fp32 matmul precision to the reference's
-``"high"``.
+``"high"`` and defaults ``_use_replicated_tensor_module`` on
+``MMDistributedDataParallel`` so validation can run on newer Torch.
 
 ``optimization_modules`` loads this module, so importing it registers every
 Group with TurboPhysAI.
@@ -65,6 +69,14 @@ _ASSIGN_API = (
 # ``mmcv.parallel``'s subclass does not define ``__init__``; installing the
 # wrapper shadows the inherited Torch DDP constructor on the subclass only.
 _DDP_API = "mmcv.parallel.distributed.MMDistributedDataParallel.__init__"
+# MMCV 1.6 reads ``_use_replicated_tensor_module`` here, which newer Torch DDP
+# no longer defines; reached by ``model(return_loss=False, ...)`` at validation.
+_DDP_FORWARD_API = (
+    "mmcv.parallel.distributed.MMDistributedDataParallel._run_ddp_forward"
+)
+_CHAMFER_SCORE_API = (
+    "projects.mmdet3d_plugin.datasets.map_utils.tpfp_chamfer.custom_polyline_score"
+)
 
 # ``torch.compile``/``torch._dynamo`` need a new enough Torch and the user's
 # consent, so the Groups that depend on them dispatch per call instead of
@@ -75,6 +87,10 @@ _STATIC_ASSIGNER_CONDITION = (
     "static_assigner_available"
 )
 _PV_MASK_CONDITION = "turbo_physai.optimizations.models.maptrv2.compat.pv_mask_sampling_enabled"
+_EVAL_COMPAT_CONDITION = (
+    "turbo_physai.optimizations.models.maptrv2.compat."
+    "shapely_query_returns_indices"
+)
 
 
 TRAINING = group(
@@ -84,6 +100,21 @@ TRAINING = group(
         aliases=("projects.mmdet3d_plugin.bevformer.apis.custom_train_detector",),
         replacement=(
             "turbo_physai.optimizations.models.maptrv2.training.training_runtime_wrapper"
+        ),
+    ),
+    wrap(
+        target=_DDP_FORWARD_API,
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2.training."
+            "ddp_forward_compat_wrapper"
+        ),
+    ),
+    wrap(
+        target="mmcv.runner.dist_utils.init_dist",
+        aliases=("mmcv.runner.init_dist",),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2.training."
+            "init_dist_fork_wrapper"
         ),
     ),
 )
@@ -390,6 +421,23 @@ DDP_STATIC_GRAPH = group(
     ),
 )
 
+# ``tpfp.py`` binds the function with ``from .tpfp_chamfer import ...``, so the
+# importing module's name is an alias the replacement must cover as well.
+EVAL_COMPAT = group(
+    "maptrv2.eval_compat",
+    replace(
+        target=_CHAMFER_SCORE_API,
+        aliases=(
+            "projects.mmdet3d_plugin.datasets.map_utils.tpfp.custom_polyline_score",
+        ),
+        replacement=(
+            "turbo_physai.optimizations.models.maptrv2."
+            "eval_compat.custom_polyline_score"
+        ),
+        runtime_condition=_EVAL_COMPAT_CONDITION,
+    ),
+)
+
 __all__ = [
     "ASSIGNER",
     "BEV_POOL_FIX",
@@ -399,6 +447,7 @@ __all__ = [
     "DATASET_VECTORIZATION",
     "DDP_STATIC_GRAPH",
     "EFFICIENTNET",
+    "EVAL_COMPAT",
     "FUSED_ADAMW",
     "GRID_MASK",
     "MATCH_COST",

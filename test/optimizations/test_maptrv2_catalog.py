@@ -35,6 +35,7 @@ EXPECTED_GROUPS = {
     "maptrv2.reference_boundaries": Mechanism.WRAPPER,
     "maptrv2.dataset_vectorization": Mechanism.REPLACE,
     "maptrv2.ddp_static_graph": Mechanism.WRAPPER,
+    "maptrv2.eval_compat": Mechanism.REPLACE,
 }
 
 # Groups whose members must re-check an optional dependency on every call.
@@ -48,6 +49,8 @@ EXPECTED_CONDITIONS = {
         "turbo_physai.optimizations.models.maptrv2.compat.pv_mask_sampling_enabled", 3),
     "maptrv2.reference_boundaries": (
         "turbo_physai.optimizations.models.maptrv2.compat.torch_compile_available", 5),
+    "maptrv2.eval_compat": (
+        "turbo_physai.optimizations.models.maptrv2.compat.shapely_query_returns_indices", 1),
 }
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -136,7 +139,7 @@ class CatalogTest(unittest.TestCase):
             [
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
                 "DATACONTAINER_PIN", "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
-                "FUSED_ADAMW", "GRID_MASK", "MATCH_COST", "PV_MASK",
+                "EVAL_COMPAT", "FUSED_ADAMW", "GRID_MASK", "MATCH_COST", "PV_MASK",
                 "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "SYNC_ELIMINATION", "TRAINING",
             ],
         )
