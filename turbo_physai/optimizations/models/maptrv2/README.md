@@ -21,7 +21,6 @@ maptrv2/
 │   ├── compile.py               # torch.compile / dynamo.disable 包装器
 │   ├── data.py                  # build_dataloader（pin_memory=True）
 │   ├── dataset_vectorization.py # 弧长重采样核心 + shift_fixed_num_sampled_points_v2
-│   ├── ddp.py                   # DDP 构造点的 static_graph 注入
 │   ├── grid_mask.py             # Dynamo 安全的 GridMask.forward
 │   ├── match_cost.py            # cdist(p=1) -> 广播减法
 │   ├── pv_mask.py               # PV/BEV 掩码绘制路径的向量化与变换合并
@@ -31,7 +30,7 @@ maptrv2/
 ```
 
 测试位于仓库级 `test/optimizations/`，共 9 个 `test_maptrv2_*.py`（catalog 结构、
-implementations、extensions、dataset_vectorization、ddp、sync_elimination 与 v4/v3 专项），
+implementations、extensions、dataset_vectorization、ddp、sync_elimination 及各 Group 专项），
 一键运行入口为 `scripts/test_maptrv2.sh`。
 
 `configs/optimization.yaml` 与生成记录（`.optimization.yaml.generation.json`）随仓库交付。
@@ -40,9 +39,10 @@ implementations、extensions、dataset_vectorization、ddp、sync_elimination �
 `optimization generate --force` 在干净基线 worktree 上重新生成，避免沿用不同
 PyTorch/MMCV 版本的证据。
 
-v4 DataContainer 后台 pin 与 v3 Apex FusedAdamW 已作为两个独立 Group 接入（recipe 与
-生成配置中默认开启，可用 `enabled: false` 关闭）。启用方法和断点兼容限制见
-[v4_v3.md](v4_v3.md)。
+`maptrv2.datacontainer_pin`（DataContainer 后台 pin）与 `maptrv2.fused_adamw`
+（Apex FusedAdamW）是两个独立 Group，recipe 与生成配置中默认开启，可用
+`enabled: false` 关闭。启用方法、断点兼容限制，以及 `maptrv2.sync_elimination`
+（A1/A2）的实现说明见 [note.md](note.md) §4.14、§4.15。
 
 ## Group 一览
 
@@ -62,7 +62,6 @@ v4 DataContainer 后台 pin 与 v3 Apex FusedAdamW 已作为两个独立 Group �
 | `maptrv2.assigner` | 静态契约（`pad_to_static_list` / `get_target_single` / `get_label_result`）加 `torch._dynamo.disable` 隔离 SciPy Hungarian 求解；`assign` 自身的 `torch.compile` 另由 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE` 控制，默认不开 | 开 | `TURBO_PHYSAI_DISABLE_ASSIGNER_STATIC=1` 关闭静态化 |
 | `maptrv2.bev_pool_fix` | 兼容 `bev_pool` 的两种 5D 布局，并吸收参考实现的布尔掩码索引替换；单独启用时返回基线的 4D 布局，与 `reference_boundaries` 同时启用时向其提供 5D 布局 | 开 | — |
 | `maptrv2.spconv_registry` | 允许仓库自带 SparseConv 覆盖 registry 中已注册条目；当前运行时 mmdet3d 已带 `force=True`，实际为空操作 | 开 | — |
-| `maptrv2.ddp_static_graph` | 在 `MMDistributedDataParallel` 的构造点注入 `static_graph=True` 与 `find_unused_parameters=False`。基线 `mmdet_train.py` 没有 `ddp_static_graph` 字段，所以不从 config 走，改为 wrap 该类的 `__init__`（只在 mmcv 子类上遮蔽继承，不动 Torch 的 DDP） | 开 | `TURBO_PHYSAI_DDP_STATIC_GRAPH=0`、`TURBO_PHYSAI_DDP_FIND_UNUSED_PARAMETERS=0` |
 | `maptrv2.reference_boundaries` | 包装 5 个基线原生调用方（`get_geometry_v1`/`BaseTransform.forward`/`LSSTransform.forward`/`transformer.forward`/`head.forward`），在内部重建参考实现抽出的 8 个 helper 与 5D BEV layout，用于复刻参考的编译边界 | 开 | `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 关闭 |
 
 `maptrv2.compile` 的 mode 与参考实现一致（参考 19 处挂点中 18 处用
@@ -221,15 +220,13 @@ turbo-physai run \
   `:37`/`:49`/`:59`/`:68`，以及 `map_loss.py:510`（class 在 501）、
   `nuscenes_offlinemap_dataset.py:669`、`grid_mask.py:85`、`mmdet_train.py:28`、
   `datasets/builder.py:19`、`efficientnet.py:157`。
-* `maptrv2.ddp_static_graph` 的目标不在基线 checkout 内（`mmcv.parallel.distributed`），
-  它的证据哈希由 `optimization generate` 从已安装的 mmcv 采集，因此换 mmcv 版本后需要重新
-  `generate`。
 * 上机后先跑「使用流程」的 1-3 步。`maptrv2.compile` / `maptrv2.reference_boundaries` /
-  `maptrv2.assigner` / `maptrv2.ddp_static_graph` 在 `configs/optimization.yaml` 里已经是
-  `enabled: true`，所以 A/B 的做法是**反向关闭**它们（改成 `enabled: false` 重新 `generate`）
-  来取对照组；`assign` 自身的编译另需 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE=1`。
-  `ddp_static_graph` 必须与 `maptrv2.assigner` 同时开启，且验证要看 loss 曲线而不只是看是否
-  报错——静态图接错的表现是某些参数静默不更新。
+  `maptrv2.assigner` 在 `configs/optimization.yaml` 里已经是 `enabled: true`，所以 A/B 的做法
+  是**反向关闭**它们（改成 `enabled: false` 重新 `generate`）来取对照组；`assign` 自身的编译
+  另需 `TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE=1`。
+* DDP 静态图（参考实现的 `ddp_static_graph=True` + `find_unused_parameters=False`）**已移除**：
+  实测会让部分参数静默不更新，24 epoch mAP 由 0.5611 掉到 0.1103。原因与复现记录见
+  [note.md](note.md) §3.7.1 U7。
 
 ## 注意事项
 

@@ -34,7 +34,6 @@ EXPECTED_GROUPS = {
     "maptrv2.bev_pool_fix": Mechanism.REPLACE,
     "maptrv2.reference_boundaries": Mechanism.WRAPPER,
     "maptrv2.dataset_vectorization": Mechanism.REPLACE,
-    "maptrv2.ddp_static_graph": Mechanism.WRAPPER,
     "maptrv2.eval_compat": Mechanism.REPLACE,
 }
 
@@ -138,7 +137,7 @@ class CatalogTest(unittest.TestCase):
             sorted(catalog.__all__),
             [
                 "ASSIGNER", "BEV_POOL_FIX", "COMPILE", "DATA",
-                "DATACONTAINER_PIN", "DATASET_VECTORIZATION", "DDP_STATIC_GRAPH", "EFFICIENTNET",
+                "DATACONTAINER_PIN", "DATASET_VECTORIZATION", "EFFICIENTNET",
                 "EVAL_COMPAT", "FUSED_ADAMW", "GRID_MASK", "MATCH_COST", "PV_MASK",
                 "REFERENCE_BOUNDARIES", "SPARSE_CONV_REGISTRY", "SYNC_ELIMINATION", "TRAINING",
             ],

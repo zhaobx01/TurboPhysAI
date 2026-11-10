@@ -36,9 +36,6 @@ Group                                        Reference change
                                              plus the reference BEV layout
 ``maptrv2.dataset_vectorization``            arc-length resampling for
                                              ``shift_fixed_num_sampled_points_v2``
-``maptrv2.ddp_static_graph``                 ``static_graph=True`` and
-                                             ``find_unused_parameters=False``
-                                             on ``MMDistributedDataParallel``
 ``maptrv2.eval_compat``                      chamfer evaluation tolerates the
                                              index array returned by Shapely 2
                                              ``STRtree.query``
@@ -68,7 +65,6 @@ _ASSIGN_API = (
 )
 # ``mmcv.parallel``'s subclass does not define ``__init__``; installing the
 # wrapper shadows the inherited Torch DDP constructor on the subclass only.
-_DDP_API = "mmcv.parallel.distributed.MMDistributedDataParallel.__init__"
 # MMCV 1.6 reads ``_use_replicated_tensor_module`` here, which newer Torch DDP
 # no longer defines; reached by ``model(return_loss=False, ...)`` at validation.
 _DDP_FORWARD_API = (
@@ -410,17 +406,6 @@ SPARSE_CONV_REGISTRY = group(
     ),
 )
 
-DDP_STATIC_GRAPH = group(
-    "maptrv2.ddp_static_graph",
-    wrap(
-        target=_DDP_API,
-        replacement=(
-            "turbo_physai.optimizations.models.maptrv2.ddp."
-            "ddp_constructor_wrapper"
-        ),
-    ),
-)
-
 # ``tpfp.py`` binds the function with ``from .tpfp_chamfer import ...``, so the
 # importing module's name is an alias the replacement must cover as well.
 EVAL_COMPAT = group(
@@ -445,7 +430,6 @@ __all__ = [
     "DATA",
     "DATACONTAINER_PIN",
     "DATASET_VECTORIZATION",
-    "DDP_STATIC_GRAPH",
     "EFFICIENTNET",
     "EVAL_COMPAT",
     "FUSED_ADAMW",

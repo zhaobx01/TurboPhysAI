@@ -282,7 +282,7 @@ def assign(
     eps=1e-7,
 ):
     global _COMPILED_ASSIGN
-    if os.getenv("TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE", "0") != "1":
+    if os.getenv("TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE", "1") != "1":
         return _assign_no_grad(
             self,
             bbox_pred,

@@ -72,11 +72,6 @@ optimization_groups:
   # Eight reference helper boundaries and the reference 5D BEV layout.
   - id: maptrv2.reference_boundaries
     enabled: true
-  # static_graph=True + find_unused_parameters=False on the DDP constructor.
-  # Keep this paired with maptrv2.assigner: the static graph assumes a fixed
-  # autograd graph, which pad_to_static_list provides.
-  - id: maptrv2.ddp_static_graph
-    enabled: true
   # Validation: Shapely 2 STRtree.query returns indices, not geometries.
   - id: maptrv2.eval_compat
     enabled: true
