@@ -1,0 +1,13 @@
+export PHYS_ROOT=/workspace/TurboPhysAI/TurboPhysAI
+export GROOT_OPT="$PHYS_ROOT/turbo_physai/optimizations/models/groot_optimization"
+export GROOT_MODEL=/workspace/TurboPhysAI/model/Isaac-GR00T
+
+export PYTHONPATH="$PHYS_ROOT:$GROOT_OPT:$GROOT_MODEL${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+cd "$PHYS_ROOT"
+
+python3 -m pytest "$GROOT_OPT/tests" \
+  -p no:cacheprovider \
+  -x -v

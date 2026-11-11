@@ -33,6 +33,12 @@ def apply(*args: Any, **kwargs: Any):
 
 
 def __getattr__(name: str) -> Any:
+    if name == "_C":
+        # PyTorch loads the shared libraries needed by the native extension.
+        import_module("torch")
+        value = import_module("turbo_physai._C")
+        globals()[name] = value
+        return value
     if name == "operators":
         value = import_module("turbo_physai.operators")
         globals()[name] = value
