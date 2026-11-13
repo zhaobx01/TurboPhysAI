@@ -1,0 +1,23 @@
+{
+  "schema_version": "turbophysai/generation-record/v2",
+  "generator": "turbo-physai optimization generate",
+  "model_commit": "c8f03f48af692657d3060c19588038c7220e9af9",
+  "config": {
+    "path": "optimization.yaml",
+    "sha256": "b13f9072df2915670aac4e42a8f5ccefe585400891ca93ef628b5bc059ae2899"
+  },
+  "inputs": [
+    {
+      "role": "recipe",
+      "base": "package",
+      "path": "optimizations/models/openvla/configs/recipe.yaml",
+      "sha256": "5dcce621c972e060bb8ae94798a2541fbdcf4557bdc8e416495256db8bc0fce5"
+    },
+    {
+      "role": "catalog",
+      "base": "package",
+      "path": "optimizations/models/openvla/catalog.py",
+      "sha256": "dc2e715a0d83331b505ac217e8aecf09e3dbe2513decb601b6d3196a203e47ed"
+    }
+  ]
+}
