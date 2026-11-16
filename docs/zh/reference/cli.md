@@ -1,6 +1,6 @@
 # CLI 参考
 
-产品镜像和源码安装环境均使用 `turbo-physai`。仅在尚未安装组件的源码开发目录中，可使用 `PYTHONPATH=. python -m turbo_physai.cli` 调用同一入口。
+配套镜像和源码安装环境均使用 `turbo-physai`。仅在尚未安装组件的源码开发目录中，可使用 `PYTHONPATH=. python -m turbo_physai.cli` 调用同一入口。
 
 ## optimization init
 
@@ -49,6 +49,7 @@ turbo-physai run \
   [--disable-group GROUP_ID[,GROUP_ID...]] \
   [--set NAME=VALUE] \
   [--disable-numa] \
+  [--accuracy] \
   <training-command>
 ```
 
@@ -62,6 +63,7 @@ turbo-physai run \
 | `--disable-group GROUP_ID[,GROUP_ID...]` | 本次启动不应用指定的一个或多个 Group |
 | `--set NAME=VALUE` | 覆盖或增加非空环境变量，可重复 |
 | `--disable-numa` | 关闭本次启动的 NUMA 绑定；默认开启 |
+| `--accuracy` | 应用标记 `accuracy_only: true` 的 Group 及 RuntimeConfig 的 `environment.accuracy` 段；默认关闭 |
 
 训练命令直接写在 TurboPhysAI 参数之后，框架逐字透传，不解析或改写启动器参数。可以使用 `torchrun`、`torchpack dist-run`、DeepSpeed、accelerate、`mpirun`、`srun` 或 Shell 启动脚本，TurboPhysAI 会在每个 Python 训练 rank 中自动应用 OptimizationConfig。
 

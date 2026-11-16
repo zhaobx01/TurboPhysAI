@@ -11,21 +11,9 @@ TurboPhysAI 的 OpenVLA 优化基于官方仓库 commit `c8f03f48af692657d3060c1
 
 ## 3. 构建训练环境
 
-### 3.1 构建容器
+### 3.1 创建容器并安装 TurboPhysAI
 
-```bash
-docker run -it --name openvla \
---network=host \
---cap-add=SYS_PTRACE \
---security-opt seccomp=unconfined \
--v /opt/hyhal:/opt/hyhal/:ro \
---privileged=true \
---shm-size 64G \
-harbor.sourcefind.cn:5443/hcu/admin/base/custom:dit-vla-wm-base-ubuntu22.04-dtk26.04-torch2.10-py3.10-20260929
-```
-
-下文命令均在容器内执行。
-
+按照[安装指南](../../docs/zh/get_started/installation.md#使用配套镜像)，使用 VLA 配套镜像创建容器并安装 TurboPhysAI。下文命令均在容器内执行。
 
 ### 3.2 安装 OpenVLA 训练依赖
 
@@ -42,8 +30,6 @@ pip install --force-reinstall --no-deps -r /path/to/TurboPhysAI/model_examples/O
 # 安装 dlimp
 pip install "dlimp @ git+https://github.com/moojink/dlimp_openvla" --no-deps
 ```
-
-安装 TurboPhysAI 框架见[安装说明](../../docs/zh/get_started/installation.md)。
 
 ## 4. 准备模型源码
 
@@ -105,6 +91,8 @@ openvla也可以改为加载本地检查点，此时需通过 `--pretrained_chec
 `turbo-physai run` 自动加载随包交付的 [OptimizationConfig](../../docs/zh/user_guide/optimization_config.md) 和 [RuntimeConfig](../../docs/zh/user_guide/runtime_config.md)，无需修改模型源码即可应用 OpenVLA 优化。OpenVLA 优化覆盖该训练栈的算子、通信、数据与可复现性环节。
 
 OpenVLA RuntimeConfig 包含训练所需的运行环境和 NUMA 配置。
+
+`openvla.reproducibility.data_order` 和 `.determinism` 标记为 `accuracy_only`，默认不应用；需要逐 step 对齐 loss 时，在启动命令中加 `--accuracy`。该开关同时应用 RuntimeConfig 的 `environment.accuracy` 段。
 
 ### 7.1 快速验证（单机八卡）
 
