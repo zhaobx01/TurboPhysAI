@@ -31,8 +31,13 @@ def _memory_percentages(cards, device_count):
     return percentages
 
 
-def wait_for_idle_devices(log_path, *, device_count=8, query=_query_devices, sleep=time.sleep, clock=time.monotonic):
-    """Require three idle samples and report total elapsed waiting time."""
+def wait_for_idle_devices(log_path, *, device_count=8, check_interval=30, required_consecutive=3,
+                          query=_query_devices, sleep=time.sleep, clock=time.monotonic):
+    """Require consecutive idle samples and report total elapsed waiting time."""
+    if not math.isfinite(check_interval) or check_interval <= 0:
+        raise ValueError("check_interval must be positive and finite")
+    if not isinstance(required_consecutive, int) or required_consecutive < 1:
+        raise ValueError("required_consecutive must be a positive integer")
     consecutive = 0
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,14 +57,16 @@ def wait_for_idle_devices(log_path, *, device_count=8, query=_query_devices, sle
             row['error'] = f'{type(exc).__name__}: {exc}'
             status = f"显存查询失败：{row['error']}"
         row['consecutive_idle'] = consecutive
+        row['required_consecutive'] = required_consecutive
+        row['check_interval_seconds'] = check_interval
         row['elapsed_seconds'] = clock() - start
         minutes, seconds = divmod(int(row['elapsed_seconds']), 60)
         with path.open('a', encoding='utf-8') as log:
             log.write(json.dumps(row, ensure_ascii=False) + '\n')
-        print(f'{status}；连续空闲 {consecutive}/3；已等待 {minutes}分{seconds:02d}秒', flush=True)
-        if consecutive == 3:
+        print(f'{status}；连续空闲 {consecutive}/{required_consecutive}；已等待 {minutes}分{seconds:02d}秒', flush=True)
+        if consecutive == required_consecutive:
             return
-        sleep(10)
+        sleep(check_interval)
 
 
 def main():

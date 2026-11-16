@@ -10,7 +10,7 @@ CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 
 
 def test_config_receipt_is_valid():
-    assert verify_generated(CONFIGS / "optimization.yaml")["model_commit"] == "d9bdcf9686649761440496445dd60c1bbb225ea1"
+    assert verify_generated(CONFIGS / "optimization.yaml")["model_commit"] == "51d4c89f72fda44cbf77285c6a8114b52676b8a1"
 
 
 def test_generated_config_matches_recipe_group_enablement():
@@ -18,8 +18,12 @@ def test_generated_config_matches_recipe_group_enablement():
     config = yaml.safe_load((CONFIGS / "optimization.yaml").read_text())
     recipe_groups = {g["id"]: g["enabled"] for g in recipe["optimization_groups"]}
     config_groups = {g["id"]: g["enabled"] for g in config["optimization_groups"]}
-    assert len(config_groups) == 16
+    assert len(config_groups) == 18
     assert config_groups == recipe_groups
+    assert sum(config_groups.values()) == 2
+    assert {k for k, v in config_groups.items() if v} == {"groot.compat.training_config", "groot.dit.hip_math_sdpa"}
+    assert config_groups["groot.compat.training_config"]
+    assert not config_groups["groot.compat.opencv_video"]
 
 
 @pytest.mark.model_deps
@@ -49,5 +53,5 @@ def test_all_groups_prepare_without_conflicts(tmp_path):
         environment=detect_context(),
     )
     assert not prepared.conflicts
-    assert len(prepared.groups) == 16
+    assert len(prepared.groups) == 18
     assert all(group.decision is Decision.APPLY for group in prepared.groups)

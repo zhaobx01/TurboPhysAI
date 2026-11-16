@@ -8,6 +8,7 @@ from turbo_physai.engine.execution.replacements import default_handlers
 
 @pytest.mark.model_deps
 @pytest.mark.parametrize("declaration", [
+    catalog.TRAINING_CONFIG, catalog.OPENCV_VIDEO,
     catalog.DIT_HIP_MATH_SDPA, catalog.QWEN_FAST_POS, catalog.QWEN_ROT_POS,
     catalog.QWEN_ROPE, catalog.FLASH_DISABLE, catalog.COMPILE_VISION,
     catalog.COMPILE_DIT, catalog.COMPILE_VL, catalog.PIXEL_VALUES_BF16, catalog.FIXED_PADDING,

@@ -7,6 +7,25 @@ with TurboPhysAI; the generated OptimizationConfig loads it through optimization
 from turbo_physai import group, replace, wrap
 
 
+TRAINING_CONFIG = group(
+    "groot.compat.training_config",
+    wrap(
+        target="gr00t.experiment.experiment.run",
+        aliases=("gr00t.experiment.launch_finetune.run",),
+        replacement="groot_optimization.compat.training_config_wrapper",
+    ),
+)
+
+OPENCV_VIDEO = group(
+    "groot.compat.opencv_video",
+    wrap(
+        target="gr00t.utils.video_utils.get_frames_by_indices",
+        aliases=("gr00t.data.dataset.lerobot_episode_loader.get_frames_by_indices",),
+        replacement="groot_optimization.compat.opencv_video_wrapper",
+    ),
+)
+
+
 DIT_HIP_MATH_SDPA = group(
     "groot.dit.hip_math_sdpa",
     wrap(

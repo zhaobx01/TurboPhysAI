@@ -1,23 +1,23 @@
 {
   "schema_version": "turbophysai/generation-record/v2",
   "generator": "turbo-physai optimization generate",
-  "model_commit": "d9bdcf9686649761440496445dd60c1bbb225ea1",
+  "model_commit": "51d4c89f72fda44cbf77285c6a8114b52676b8a1",
   "config": {
     "path": "optimization.yaml",
-    "sha256": "c4f5af3795dabbb05e6b462683da43aaba65930d1ef7e4d6b9d2b1e505638bf1"
+    "sha256": "a26d4f19fa915077f35b24a1326e75fc589fc01d17ed43facbb82977d89f81d3"
   },
   "inputs": [
     {
       "role": "recipe",
       "base": "package",
       "path": "optimizations/models/groot_optimization/configs/recipe.yaml",
-      "sha256": "0cc38f5cf6b9ffa53e19fa9e64024bbeca38eaf5f61d8c6f01d449cf8603bc01"
+      "sha256": "cd6a5ddedcad5a6f7bbec59d34f27dc6fd7470e8d307d444b6425987e4a3dd85"
     },
     {
       "role": "catalog",
       "base": "package",
       "path": "optimizations/models/groot_optimization/groot_optimization/catalog.py",
-      "sha256": "da926ba0d91039163d59831c531a276765fc126c8ebb54be006f239a851445fd"
+      "sha256": "80544afae7c57c3cb10dccd4cf17756678ef8dbcd4739fcce677c6c0b9b3919e"
     }
   ]
 }

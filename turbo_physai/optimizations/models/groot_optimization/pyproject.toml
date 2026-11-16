@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "groot optimizations developed with TurboPhysAI"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+official = ["wandb==0.23.0"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["groot_optimization*"]

@@ -1,110 +1,150 @@
-# GR00T 接入 PhysAI
+# GR00T 接入 TurboPhysAI
 
-## 任务目标与基线
+本目录在官方 Isaac-GR00T 源码上，通过 TurboPhysAI 注入 HCU/DTK 兼容处理和性能优化。完整环境、数据、权重及快速验证流程见 [GR00T 应用说明](../../../../model_examples/Groot/README.md)，已完成的检查和历史训练记录见 [VALIDATION.md](VALIDATION.md)。
 
-以 Isaac-GR00T 为模型代码基线，将 HCU/DTK 正确性兼容处理和经过验证的性能优化接入 PhysAI，拆分为可独立启用、检查、回滚和验证的 Optimization Group，并交付配置、测试及验证记录。
+## 基线与默认配置
 
-模型基线固定为 `/workspace/TurboPhysAI/model/Isaac-GR00T` 的 `d9bdcf9686649761440496445dd60c1bbb225ea1`（HCU 适配）。该提交位于待迁移的 Qwen 算法修改、局部编译及后续训练优化之前。模型代码基线与 PhysAI 代码版本、配置和运行环境应分别记录；当前 Group 的数值验证范围见下文。
+模型源码仅支持官方提交 `51d4c89f72fda44cbf77285c6a8114b52676b8a1`。运行前保持模型工作区干净，不需要修改官方源码。旧 HCU 适配提交 `d9bdcf9` 的结果只作历史参考，不能直接归到官方基线。
 
-## 已接入：DiT HIP math SDPA
+仓库 Recipe 和生成配置包含18个 Group，当前默认仅开启：
 
-`groot.dit.hip_math_sdpa` 包装 GR00T 的 DiT `_sdpa_context`：在 HIP 上为该注意力上下文选择 PyTorch math SDPA，退出上下文后恢复原后端设置。在非 HIP 环境或设置 `GR00T_DIT_SDPA_MODE=default` 时，保留模型原有行为。该开关会绕过此兼容处理。
+- `groot.compat.training_config`
+- `groot.dit.hip_math_sdpa`
 
-该兼容项参考 GR00T 后续的 HIP 修复。math 后端可能改变性能；它是正确性兼容处理，其性能影响需要实测。
+其余16项关闭，包括 OpenCV 和 `pad_156`。默认使用官方 torchcodec 解码和原始输入长度。应用说明中的 OpenCV 示例会单独生成三项兼容配置，不修改仓库默认配置。
 
-### 当前验证结果
+## 目录与依赖
 
-- 未启用该 Group 的一次 1 卡、batch 1、10 步运行中，记录的 `grad_norm` 为 NaN，保存的 `action_head.action_decoder.layer1.W` 含非有限值。该 checkpoint 不可作为有效训练起点。
-- 开启 Group 后，1 卡、batch 1、10 步运行的 OptimizationReport 显示 `groot.dit.hip_math_sdpa` 为 `applied`；第 10 步记录的 loss 为 `1.288`，`grad_norm` 为 `1.2960360050201416`，均为有限值。
-- 上述运行的 `checkpoint-10` 共检查 1030 个张量，均为有限值。日志和训练记录位于 `/workspace/data/outputs/physai-groot-math-sdpa-20261105-171612/`。
-- Group 的后端选择、原行为回退、真实目标替换和恢复及相关配置测试共 14 项通过。
-
-这次短训练仅记录了第 10 步的梯度范数，不能证明每一步梯度有限，也不能替代多卡或长时间训练的数值验证。此前 NaN 的确切根因尚未由这次对照单独证明。
-
-## 后续任务
-
-1. 增加逐步数值检查，并验证多卡和更长训练的 loss、梯度、权重及稳定性。
-2. 数值验证通过后，以 `d9bdcf9` 加 `groot.dit.hip_math_sdpa` 作为性能对照配置，记录代码版本、环境、数据、权重、训练参数、吞吐和显存。
-3. 对已接入的 Qwen 位置算法、局部编译、数据转换、优化器和 ZeRO-2 Group 逐项验证数值、梯度与性能。
-4. 验证 Group 组合，固定 PhysAI 版本与配置，保留 OptimizationReport、测试结果及性能记录。
-
-## 实验性性能 Group
-
-以下 Group 已声明，但尚未完成目标设备的数值、稳定性和性能验证。`recipe.yaml` 仅启用 math SDPA 兼容项，其他 Group 默认关闭，这是唯一随工程交付的配置；启用其他 Group 时修改 Recipe 的 `enabled` 后重新生成。集成测试在临时副本中启用全部 Group，检查目标冲突，不交付第二份配置。修改 Recipe 后必须重新生成配置，以采集对应的源码证据；不要直接修改生成的 YAML。禁用 Group 不生成源码证据，启用前必须重新生成。
-
-位置算法来自 Isaac-GR00T `2838dd8` 及后续 `bba613c` 代码；编译、数据转换、Apex 与 ZeRO-2 实现参考 `bb1cb72` 至 `bba613c` 的工作树。视觉块 forward 级编译与原类级编译并非同一实现。部分 Group 已完成下文所述的小模型设备测试；完整模型的训练行为尚未验证，不能凭安装成功推断运行时生效或数值正确。
-
-| Group | 作用及条件 |
+| 位置 | 内容 |
 | --- | --- |
-| `groot.qwen.fast_pos_embed_interpolate` | 在 CPU 构造位置插值索引，保留设备侧的可训练位置嵌入查表。 |
-| `groot.qwen.rot_pos_emb` | 在 CPU 构造视觉旋转位置坐标。 |
-| `groot.qwen.get_rope_index` | 多模态输入的位置索引在 CPU 计算后返回原设备。 |
-| `groot.qwen.flash_attn_dynamo_disable` | 将 Transformers 的 Flash Attention 集成排除在 Dynamo 图之外。 |
-| `groot.compile.qwen_vision_block` | 编译视觉块 `forward`，依赖上一个 Group；这与原仓库的类级编译不等价，须验证 hook、梯度检查点及图行为。 |
-| `groot.compile.dit`、`groot.compile.vl` | 分别编译 DiT 与视觉语言注意力模块的 `forward`。 |
-| `groot.data.pixel_values_bf16` | 在 DeepSpeed BF16 场景下将 collator 的 CPU 图像数据提前转换为 BF16。 |
-| `groot.data.pad_156` | 在 Trainer 输入准备阶段使用 tokenizer 的 pad token 将文本输入左侧补齐到 156；拒绝超长、非左填充掩码和不支持的字段。 |
-| `groot.optim.apex_fused_adam` | 在支持条件下通过 Transformers 优化器工厂选择 Apex FusedAdam，需要 Apex 及其多张量扩展。 |
-| `groot.zero2.grad_reduce_overlap` | 实验性 ZeRO-2 梯度归约重叠，仅适用于经过校验的 DTK DeepSpeed/Torch 版本；必须先通过真实多卡正确性验证。 |
-| `groot.qwen.disable_kv_cache` | 未显式请求缓存且未传入已有缓存时，关闭文本模型隐式 KV cache。 |
-| `groot.compile.qwen_text_layer` | 编译 Qwen 文本解码层 `forward`，依赖 Flash Attention 排除和隐式 KV cache 控制。 |
-| `groot.zero2.owner_reduce` | GRO 中按分片 owner 归约梯度；不满足调用条件时回退原方法。依赖 GRO。 |
-| `groot.zero2.allgather_pipeline` | 重分组优化器，在逐组参数更新后异步提交 AllGather；默认要求 8 个数据并行 rank。 |
+| `groot_optimization/` | Catalog、兼容处理、模型与优化器替换实现 |
+| `configs/recipe.yaml` | 仓库默认 Group 开关 |
+| `configs/optimization.yaml` | CLI 生成的模型兼容及替换配置 |
+| `configs/.optimization.yaml.generation.json` | 配置生成记录和输入指纹 |
+| `configs/runtime.yaml` | 本地 Cosmos、离线模式、MIOpen 和 NUMA 设置 |
+| `scripts/` | 训练、测速、GEMM、Profiler 和资源等待工具 |
+| `tests/` | CPU 行为测试、真实目标集成测试及设备测试 |
 
-编译 Group 可通过 `options.mode` 指定模式，默认为 `max-autotune-no-cudagraphs`；设置 `TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 可禁用包装。ZeRO-2 的 `options.strict` 默认为 `true`：不满足运行条件时报错；设为 `false` 才允许回退原实现。配置选项不会替代设备上的正确性和性能验证。
+保留镜像提供的 DTK 版 Torch、DeepSpeed、FlashAttention、Triton、Apex 等组件。普通训练依赖清单见应用说明；不要用官方 `uv sync` 替换当前 Python 3.10 / DTK 环境。官方入口直接导入 W&B，即使关闭上报也需要 `wandb==0.23.0`。
 
-`groot.data.pad_156` 对应原仓库 `GR00T_COMPILE_SEQUENCE_POLICY=pad-156` 的固定左填充策略，由 PhysAI Group 开关控制，不读取该环境变量。它会改变输入形状，当前尚未验证模型输出、梯度或训练数值等价性，也未证明性能收益；超过 156 的输入不会截断，而是报错。
-
-ZeRO-2 一致性检查在 optimizer 构造完成后运行，比较各 rank 的适用性和分片布局；其异步事件生命周期及真实多卡调用顺序尚未验证。使用前必须完成 2 卡和 8 卡逐步梯度、参数更新与异常路径测试。除 ZeRO-2 外，当前 Group 尚未提供完整的运行时激活计数或逐实例日志，OptimizationReport 的 `applied` 只表示替换已安装，不代表运行路径一定触发。
-
-新接入的 Text 编译、OBR 和 AllGather 流水默认关闭。Text 编译已在 HCU 上通过 16 层小模型的输出、梯度和单图检查。OBR 在 2 卡及 8 卡 ZeRO-2 小模型上通过逐步对照并覆盖 reduce-scatter；AllGather 在 8 卡小模型上通过正常更新、溢出和一次同步注入的异常检查。这些测试不能替代完整模型训练及长时间稳定性验证；三者均未完成性能验证。AllGather 使用 `options.group_elements`（默认 100000000）、`options.world_size`（默认 8）和 `options.strict`（默认 true）；要求 BF16、梯度累积为 1，不支持从 checkpoint 恢复或训练中途保存，并仅支持非 fused 的 `torch.optim.AdamW` 或兼容的 Apex FusedAdam。OBR 统计按路径保存在 optimizer 的 `_turbo_physai_obr` 中。`pad_156` 已知会改变 VL 自注意力数值，不应与其他 Group 一同默认启用。
-
-CPU 小模型测试中，16 层文本模型不使用 KV cache 时共用一张 Dynamo 图；使用 cache 时达到 8 次重编译上限。AllGather 若异步请求等待失败，会保留仍在途的请求和张量引用；执行 step 发生异常后拒绝复用该优化器。单个 rank 在其他 rank 提交下一次集合通信之前异常退出仍可能导致后者阻塞，应终止整个分布式作业；异常路径尚需多卡验证。`strict: false` 的回退使用已经重分组的优化器，参数组结构可能与原始优化器不同。
-
-## 使用与验证
-
-`configs/runtime.yaml` 设置当前工作区的本地 Cosmos 路径、离线模式和关闭 W&B，清理视频后端及编译缓存等环境变量，并关闭 PhysAI 自动 NUMA 绑定，以匹配当前参考启动方式。它默认使用 torchcodec；部署环境须有可用的 torchcodec。该文件不设置设备数量、训练步数或 batch size。路径在其他环境中可通过 `--set VLM_MODEL_PATH=/path/to/checkpoint` 覆盖；环境变量由 RuntimeConfig 设置时，使用 `--set` 可以覆盖配置，包括选择 `VIDEO_DECODER_BACKEND=opencv`。若需要自定义缓存路径，也可通过 `--set TORCHINDUCTOR_CACHE_DIR=...` 设置。优化 Group 仍由 OptimizationConfig 控制。
-
-以下示例使用仅启用 math SDPA 的对照配置。ZeRO-2 相关 Group（`grad_reduce_overlap`、`owner_reduce`、`allgather_pipeline`）默认 `strict: true`，单卡、非 DeepSpeed ZeRO-2 环境下若被启用会直接报错而不是静默跳过。示例要求已有 DTK 环境、模型和数据；输出目录应使用新的路径，使用原始权重而不是此前含 NaN 的 checkpoint。
+以下为当前开发容器的路径，可按部署位置调整：
 
 ```bash
 export PHYS_ROOT=/workspace/TurboPhysAI/TurboPhysAI
 export GROOT_OPT="$PHYS_ROOT/turbo_physai/optimizations/models/groot_optimization"
-export GROOT_MODEL=/workspace/TurboPhysAI/model/Isaac-GR00T
+export GROOT_MODEL=/workspace/TurboPhysAI/model/Isaac-GR00T-official
 export PYTHONPATH="$PHYS_ROOT:$GROOT_OPT:$GROOT_MODEL${PYTHONPATH:+:$PYTHONPATH}"
-export NUM_GPUS=1 GLOBAL_BATCH_SIZE=1 MAX_STEPS=10 SAVE_STEPS=1000 DATALOADER_NUM_WORKERS=0
-unset GR00T_DIT_SDPA_MODE
-cd "$GROOT_MODEL"
-python3 -m turbo_physai.cli run --disable-numa --log-report \
-  --runtime-config "$GROOT_OPT/configs/runtime.yaml" \
-  --set VIDEO_DECODER_BACKEND=opencv \
-  --optimization-config "$GROOT_OPT/configs/optimization.yaml" -- \
-  bash examples/finetune.sh \
-    --base-model-path /workspace/data/checkpoints/GR00T-N1.7-3B-local-cosmos \
-    --dataset-path /workspace/data/libero_10_no_noops_1.0.0_lerobot_h264 \
-    --embodiment-tag LIBERO_PANDA \
-    --output-dir /workspace/data/outputs/physai-groot-math-sdpa-smoke \
-    --state-dropout-prob 0.2 --save-only-model
+python3 -m pip install -e "${GROOT_OPT}[official]"
 ```
 
-确认每个训练进程的 OptimizationReport 中该 Group 为 `applied`，检查整个训练过程的 loss、梯度和保存权重均为有限值，再进行多卡及更长训练验证。日志中的最终 loss 或训练进程成功退出不足以证明每一步数值正常。不能用 `python -c` 验证启动注入，因为框架有意跳过此类进程。
+子包安装使用 pip 默认隔离构建；不要求升级镜像中的系统 setuptools。框架本身的安装见[安装说明](../../../../docs/zh/get_started/installation.md)。
 
-可在设备空闲、依赖齐备时复现小模型检查，以下只执行测试，不启动 GR00T 训练：
+## Group 清单
 
-```bash
-cd "$PHYS_ROOT"
-python3 -m pytest "$GROOT_OPT/tests/test_compile_text.py" -m hcu -q
-python3 -m torch.distributed.run --standalone --nproc_per_node=2 -m pytest \
-  "$GROOT_OPT/tests/test_hcu_zero2.py" -k owner -q
-python3 -m torch.distributed.run --standalone --nproc_per_node=8 -m pytest \
-  "$GROOT_OPT/tests/test_hcu_zero2.py" -q
-```
+| Group | 默认 | 作用 |
+| --- | --- | --- |
+| `groot.compat.training_config` | 开 | 不支持 TF32 时关闭已请求的 TF32；用非空 `VLM_MODEL_PATH` 覆盖本地 Cosmos 路径，并处理训练入口函数别名。 |
+| `groot.compat.opencv_video` | 关 | 可选 OpenCV CPU 索引帧读取，处理数据加载器函数别名、帧顺序和重复索引。 |
+| `groot.dit.hip_math_sdpa` | 开 | HIP 上为动作 DiT 使用 Math SDPA；`GR00T_DIT_SDPA_MODE=default` 可覆盖此选择。 |
+| `groot.qwen.flash_attn_dynamo_disable` | 关 | 将 Flash Attention 集成调用排除在 Dynamo 图之外。 |
+| `groot.qwen.disable_kv_cache` | 关 | 未显式指定 `use_cache` 且无已有 KV 时关闭隐式缓存。 |
+| `groot.data.pad_156` | 关 | 在输入准备阶段将文本左侧补齐至156；拒绝超长或不支持的输入。 |
+| `groot.qwen.fast_pos_embed_interpolate` | 关 | CPU 构造并缓存位置插值元数据，设备侧保留嵌入查表。 |
+| `groot.qwen.rot_pos_emb` | 关 | CPU 构造、缓存视觉旋转位置坐标并批量搬运。 |
+| `groot.qwen.get_rope_index` | 关 | 将多模态位置索引计算移到 CPU，结果返回原设备。 |
+| `groot.compile.qwen_vision_block` | 关 | 编译视觉 Block 的 `forward`，依赖 Flash Attention 边界隔离。 |
+| `groot.compile.dit` | 关 | 编译 `DiT.forward` 和 `AlternateVLDiT.forward`。 |
+| `groot.compile.vl` | 关 | 编译整个 `SelfAttentionTransformer.forward`。 |
+| `groot.data.pixel_values_bf16` | 关 | DeepSpeed BF16 训练下，在 collator 中提前转换 CPU 图像张量。 |
+| `groot.optim.apex_fused_adam` | 关 | 通过 Transformers 选择 Apex FusedAdam，要求多张量扩展可用。 |
+| `groot.zero2.grad_reduce_overlap` | 关 | 在匹配的 DTK DeepSpeed 上优化梯度桶归约重叠。 |
+| `groot.compile.qwen_text_layer` | 关 | 编译文本 Decoder Layer 的 `forward`，依赖 Flash Attention 隔离和 KV cache 控制。 |
+| `groot.zero2.owner_reduce` | 关 | 按梯度 owner 选择 ReduceScatter 或定向 Reduce，依赖梯度归约重叠。 |
+| `groot.zero2.allgather_pipeline` | 关 | 分组更新优化器并异步提交 AllGather。 |
 
-修改 Recipe、Catalog 或模型基线后，在干净的模型工作树重新生成配置：
+编译默认模式为 `max-autotune-no-cudagraphs`，可通过 Group 的 `options.mode` 调整；`TURBO_PHYSAI_DISABLE_TORCH_COMPILE=1` 会禁用编译包装。没有新增 `dit_blocks` 或完整模块级 `text_layers`，也没有独立的 channels-last Group。
+
+`pad_156` 会改变输入形状，已有测试表明它可能改变 VL 自注意力输出、loss 和梯度，不能视为严格数值等价。ZeRO-2 优化会检查 Torch/DeepSpeed 版本及运行条件；AllGather 流水默认要求8个数据并行 rank、BF16、梯度累积1、无 CPU offload，并限制优化器类型，不支持周期 checkpoint 或断点恢复。具体限制以运行时检查为准。
+
+## 配置生成与运行环境
+
+修改仓库 Recipe 或 Catalog 后，重新生成配置及记录；不要手改源码哈希。禁用项不采集目标证据，重新启用也需要重新生成。
 
 ```bash
 cd "$GROOT_MODEL"
 python3 -m turbo_physai.cli optimization generate \
-  --recipe "$GROOT_OPT/configs/recipe.yaml" --repo "$GROOT_MODEL" \
-  --commit "$(git rev-parse HEAD)" --output "$GROOT_OPT/configs/optimization.yaml" --force
+  --recipe "$GROOT_OPT/configs/recipe.yaml" \
+  --repo "$GROOT_MODEL" \
+  --commit 51d4c89f72fda44cbf77285c6a8114b52676b8a1 \
+  --output "$GROOT_OPT/configs/optimization.yaml" --force
+python3 -m turbo_physai.cli optimization check \
+  "$GROOT_OPT/configs/optimization.yaml" --repo "$GROOT_MODEL"
 ```
+
+Git 若报 `dubious ownership`，先仅信任该模型目录：`git config --global --add safe.directory "$GROOT_MODEL"`。临时实验可另存 Recipe 和生成配置，避免影响共享配置。
+
+`runtime.yaml` 默认使用 `/workspace/data/checkpoints/nvidia/Cosmos-Reason2-2B`、关闭在线 W&B 上报、开启 Hugging Face 离线模式，设置 `MIOPEN_FIND_MODE=1` 和 `PYTORCH_MIOPEN_SUGGEST_NHWC=1`，不进行 PhysAI NUMA 绑定。新机器可用 CLI 的 `--set` 覆盖路径。
+
+OpenCV 需要同时启用对应 Group、重新生成配置，并在运行时传入 `--set VIDEO_DECODER_BACKEND=opencv`；只设置其中一项不会完成切换。OpenCV 分支处理索引帧，不使用 torchcodec 专用 `decoder_kwargs`。训练时显式传入 `--optimization-config` 和 `--runtime-config`，完整示例见应用说明。
+
+`applied` 表示注入成功，不代表对应路径已执行、数值等价或性能提高。
+
+## 训练与测速入口
+
+| 脚本 | 行为 |
+| --- | --- |
+| `scripts/run_train__vsH20_b32_10000.sh` | 8卡、全局batch32、10000步，读取共享优化配置；关闭周期checkpoint，保留最终模型。 |
+| `scripts/run_TestSpeed_benchmark_40.sh` | 8卡、全局batch960，两轮40步测速；读取共享优化配置，不保存权重。 |
+| `scripts/run_benchmark_b960.sh` | 后台启动 `benchmark.py`，默认22方案，每方案两轮40步测速和一轮独立40步Trace。 |
+| `scripts/rank_launcher.py` | 各rank的计时、保存控制和可选Profiler，由运行器调用。 |
+| `scripts/resource_wait.py` | 共用资源等待工具，支持直接运行，位于 `scripts/` 而非优化实现包内。 |
+| `scripts/run_gemm_workflow_b960.sh` | 独立的GEMM采集、DTK选优和两轮顺序测速；需显式指定方案，不采Trace。 |
+
+前两个 Shell 脚本仍使用当前工作区的默认路径；`GROOT_MODEL` 支持外部覆盖，但 `PHYS_ROOT` 在脚本内固定，迁移部署时需检查。前台训练脚本如需断开终端后继续运行，应另用 `nohup` 等方式启动。
+
+### 22方案测速
+
+`benchmark.py` 从方案定义和Catalog依赖生成独立配置，不修改仓库 Recipe。基线不补齐；`pad_156` 单项和 `all_on` 包含固定补齐，其他方案不会自动加上该项。每个所谓“单项”仍可能包含必要依赖，实际Group清单写入报告。
+
+```bash
+# 仅检查方案，不启动训练
+python3 "$GROOT_OPT/scripts/benchmark.py" --output /tmp/groot-preview --dry-run
+# 只测试基线和固定补齐；省略 --cases 则运行全部22方案
+GR00T_BENCH_OUTPUT=/workspace/data/outputs/groot-b960-selected \
+  bash "$GROOT_OPT/scripts/run_benchmark_b960.sh" --cases baseline pad_156
+# 使用相同方案和结果目录续跑；耗尽重试的任务需 --retry-failed
+GR00T_BENCH_OUTPUT=/workspace/data/outputs/groot-b960-selected \
+  bash "$GROOT_OPT/scripts/run_benchmark_b960.sh" --cases baseline pad_156 --resume --retry-failed
+```
+
+测速入口每35秒检查8卡显存，连续4次每卡严格低于5%后放行；每次测速、Trace和重试都执行检查。查询失败或设备忙时清零。其他训练及GEMM入口默认每30秒检查、连续3次通过。等待日志包含累计时长。
+
+测速统计每步8个rank的最大墙钟耗时，不额外同步设备；记录第35步和第31–40步均值，两个成功轮次分别计算后取中位数。CV和漂移只展示，不剔除成功轮次；单轮成功明确标记。Trace单独运行，采集第35步后停止Profiler，训练继续到40步，不参与测速统计。默认共享编译缓存，不在轮次间清理。
+
+正常失败自动重试一次，两次失败后继续后续任务；用户中断不自动重试。后台入口使用锁和进程组管理；结果目录保存配置、尝试历史、日志、计时、显存采样、Trace及持续更新的 `results.json`、`report.md`。续跑核对源码、模型、环境和配置指纹，移动文件或更新实现后可能拒绝旧目录，不能手改历史指纹强行混入新结果。
+
+### GEMM工作流
+
+```bash
+# 只查看计划
+bash "$GROOT_OPT/scripts/run_gemm_workflow_b960.sh" plan --cases combo_runtime all_on
+# 确认计划后后台执行
+bash "$GROOT_OPT/scripts/run_gemm_workflow_b960.sh" start \
+  --output /workspace/data/outputs/groot-gemm-b960 --cases combo_runtime all_on
+```
+
+工作流自动把基线放在首位，所有采集和测速方案统一加入 `pad_156`。采集固定使用 `combo_obr_dit_vl_text_allgather`，8卡、batch960、40步；测速只做两轮，不采Trace。选优使用 `update_target_config=0`，归档后通过 `ROCBLAS_TENSILE_LIBPATH` 加载，不覆盖已安装rocBLAS库。每阶段失败重试一次，耗尽后停止。
+
+DTK选优仍依赖外部 `/workspace/Isaac-GR00T/getting_started/optimization/dcu_gemm_autotune.sh`，可用 `PHYS_GEMM_AUTOTUNE` 指定其他位置；该工具不会随单独克隆本优化子包提供。`status`、`stop`、`resume` 管理同一结果目录的后台任务。
+
+## 验证
+
+```bash
+cd "$PHYS_ROOT"
+CUDA_VISIBLE_DEVICES='' HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 NO_ALBUMENTATIONS_UPDATE=1 \
+python3 -m pytest "$GROOT_OPT/tests" -m 'not hcu' -q -rs
+for script in "$GROOT_OPT"/scripts/*.sh; do bash -n "$script"; done
+```
+
+最新结果、跳过原因及历史实验边界见 [VALIDATION.md](VALIDATION.md)。

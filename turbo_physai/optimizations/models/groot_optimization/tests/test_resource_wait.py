@@ -1,6 +1,10 @@
 import json
+from pathlib import Path
+import sys
 
-from groot_optimization.resource_wait import wait_for_idle_devices
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+from resource_wait import wait_for_idle_devices
 
 
 def sample(percent=1):
@@ -15,7 +19,7 @@ def test_requires_three_consecutive_samples_and_sleeps_between_checks(tmp_path):
     wait_for_idle_devices(log, query=lambda: next(responses), sleep=sleeps.append)
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert [row['consecutive_idle'] for row in rows] == [1, 2, 3]
-    assert sleeps == [10, 10]
+    assert sleeps == [30, 30]
 
 
 def test_busy_or_failed_check_resets_consecutive_count(tmp_path):
@@ -32,7 +36,7 @@ def test_busy_or_failed_check_resets_consecutive_count(tmp_path):
     wait_for_idle_devices(log, query=response, sleep=sleeps.append)
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert [row['consecutive_idle'] for row in rows] == [1, 0, 1, 0, 1, 2, 3]
-    assert len(sleeps) == 6 and all(delay == 10 for delay in sleeps)
+    assert len(sleeps) == 6 and all(delay == 30 for delay in sleeps)
 
 
 def test_missing_card_or_invalid_total_cannot_count_as_idle(tmp_path):
@@ -68,3 +72,15 @@ def test_reports_total_wait_time_without_resetting_after_busy_sample(tmp_path, c
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert [row['elapsed_seconds'] for row in rows] == [0, 30, 60, 90, 120]
     assert '已等待 2分00秒' in capsys.readouterr().out
+
+
+def test_four_idle_samples_with_35_second_interval(tmp_path, capsys):
+    responses = iter([sample(1)] * 4)
+    sleeps = []
+    log = tmp_path / 'wait.jsonl'
+    wait_for_idle_devices(log, query=lambda: next(responses), sleep=sleeps.append,
+                          check_interval=35, required_consecutive=4)
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [row['consecutive_idle'] for row in rows] == [1, 2, 3, 4]
+    assert sleeps == [35, 35, 35]
+    assert '连续空闲 4/4' in capsys.readouterr().out

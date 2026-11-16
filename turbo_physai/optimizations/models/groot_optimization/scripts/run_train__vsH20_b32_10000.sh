@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H20 日志中的训练参数：8 卡、global batch 32、10000 步；只保存最终模型。
+# 对齐 H20 日志的主要训练参数：8 卡、global batch 32、10000 步。
+# 本脚本关闭周期 checkpoint，仅保存最终模型，与 H20 日志的保存策略不同。
 export PHYS_ROOT=/workspace/TurboPhysAI/TurboPhysAI
 export GROOT_OPT="$PHYS_ROOT/turbo_physai/optimizations/models/groot_optimization"
-export GROOT_MODEL=/workspace/TurboPhysAI/model/Isaac-GR00T
+export GROOT_MODEL="${GROOT_MODEL:-/workspace/TurboPhysAI/model/Isaac-GR00T-official}"
 export DATA_ROOT=/workspace/data
 export PYTHONPATH="$PHYS_ROOT:$GROOT_OPT:$GROOT_MODEL${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -60,14 +61,14 @@ print('关闭：' + (', '.join(disabled) if disabled else '无'))
 PY
 
 cd "$GROOT_MODEL"
-# 每 10 秒检查显存，所有目标设备连续三次低于 5% 后启动。
-python3 -m groot_optimization.resource_wait \
+# 每 30 秒检查显存，所有目标设备连续三次低于 5% 后启动。
+python3 "$GROOT_OPT/scripts/resource_wait.py" \
   --devices "$NUM_GPUS" --log "$BENCH_DIR/resource-wait.jsonl"
 
 export MASTER_PORT
 MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')
 
-# 与 H20 日志使用相同训练参数；最终模型仍由训练入口保存。
+# 主要训练超参数对齐 H20 日志；最终模型仍由训练入口保存。
 python3 -m turbo_physai.cli run \
   --disable-numa \
   --log-report \

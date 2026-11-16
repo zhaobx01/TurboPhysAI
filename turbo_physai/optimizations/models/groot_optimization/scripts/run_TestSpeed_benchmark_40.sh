@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 按当前优化配置测速：8 卡、global batch 768，每轮 40 步，共两轮。
+# 按当前优化配置测速：8 卡、global batch 960，每轮 40 步，共两轮。
 export PHYS_ROOT=/workspace/TurboPhysAI/TurboPhysAI
 export GROOT_OPT="$PHYS_ROOT/turbo_physai/optimizations/models/groot_optimization"
-export GROOT_MODEL=/workspace/TurboPhysAI/model/Isaac-GR00T
+export GROOT_MODEL="${GROOT_MODEL:-/workspace/TurboPhysAI/model/Isaac-GR00T-official}"
 export DATA_ROOT=/workspace/data
 export PYTHONPATH="$PHYS_ROOT:$GROOT_OPT:$GROOT_MODEL${PYTHONPATH:+:$PYTHONPATH}"
 
-export NUM_GPUS=8 GLOBAL_BATCH_SIZE=768 MAX_STEPS=40 DATALOADER_NUM_WORKERS=4
+export NUM_GPUS=8 GLOBAL_BATCH_SIZE=960 MAX_STEPS=40 DATALOADER_NUM_WORKERS=4
 export SAVE_STEPS=1000
 unset GR00T_DIT_SDPA_MODE TURBO_PHYSAI_DISABLE_TORCH_COMPILE
 
 mkdir -p "$DATA_ROOT/outputs"
 export BENCH_DIR
-BENCH_DIR=$(mktemp -d "$DATA_ROOT/outputs/physai-groot-combo-b768-XXXXXX")
+BENCH_DIR=$(mktemp -d "$DATA_ROOT/outputs/physai-groot-combo-b960-XXXXXX")
 echo "结果目录：$BENCH_DIR"
 
 python3 - <<'PY'
@@ -108,8 +108,8 @@ cd "$GROOT_MODEL"
 for ROUND in 1 2; do
   export BENCH_ROUND_DIR="$BENCH_DIR/round-$ROUND"
   mkdir -p "$BENCH_ROUND_DIR"
-  # 每轮开始前要求 card0～card7 连续三次（每 10 秒）显存占用均低于 5%。
-  python3 -m groot_optimization.resource_wait \
+  # 每轮开始前要求 card0～card7 连续三次（每 30 秒）显存占用均低于 5%。
+  python3 "$GROOT_OPT/scripts/resource_wait.py" \
     --devices "$NUM_GPUS" --log "$BENCH_ROUND_DIR/resource-wait.jsonl"
   export MASTER_PORT
   MASTER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1])')
@@ -160,7 +160,7 @@ import statistics
 from pathlib import Path
 
 root = Path(os.environ['BENCH_DIR'])
-batch_size = 768
+batch_size = int(os.environ['GLOBAL_BATCH_SIZE'])
 results = []
 for round_number in (1, 2):
     metrics_dir = root / f'round-{round_number}' / 'step_metrics'
@@ -209,7 +209,6 @@ else:
     window_sps = statistics.median(result['mean31_40_samples_per_second'] for result in valid_results)
     print(f'第35步吞吐中位数：{step35_sps:.3f} samples/s')
     print(f'第31～40步吞吐中位数：{window_sps:.3f} samples/s')
-    print('参考报告对应值：790.621、785.739 samples/s')
 
 (root / 'summary.json').write_text(json.dumps(results, indent=2, ensure_ascii=False) + '\n')
 print(f'结果目录：{root}')
