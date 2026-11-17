@@ -4,14 +4,14 @@
   "model_commit": "e03f097abef19e1ba3fed5f471a8d80fbfa0a064",
   "config": {
     "path": "optimization.yaml",
-    "sha256": "83a4b9fad8bfe1dc7565c65325a708be796c312f8108ba5ec159c8db5af682a8"
+    "sha256": "de8ed02eac04ddd840ff58174d99ba6fad401c7d42cebb2abbc571c04ffcb212"
   },
   "inputs": [
     {
       "role": "recipe",
       "base": "package",
       "path": "optimizations/models/maptrv2/configs/recipe.yaml",
-      "sha256": "1347c1d6b5631e511c344a547fc91b9866367a41396c04b60de55a21207b3df2"
+      "sha256": "ec839196415d79795081ed31a5274e9aae16efe54437abd11e6a4f3f83274407"
     },
     {
       "role": "inherited_config",

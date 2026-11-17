@@ -1,165 +1,143 @@
 # MapTRv2 应用说明
 
-本文说明如何在产品镜像中，基于官方 MapTRv2 仓库应用 TurboPhysAI 的 HCU 优化。镜像获取和容器创建方法参见[安装指南](../../docs/zh/get_started/installation.md#使用产品镜像)。
-
 ## 1. 模型简介
 
-[MapTRv2](https://github.com/hustvl/MapTR/tree/maptrv2) 是面向自动驾驶在线矢量化地图构建的模型，通过多摄像头图像学习鸟瞰视角（BEV）特征，预测车道分隔线、人行横道、道路边界等地图元素。本文使用 ResNet-50 Backbone、BEV pooling 和 nuScenes 24 epoch 配置：
-
-```text
-projects/configs/maptrv2/maptrv2_nusc_r50_24ep.py
-```
+[MapTRv2](https://github.com/hustvl/MapTR/tree/maptrv2) 是面向自动驾驶在线矢量化地图构建的模型，通过多摄像头图像提取鸟瞰视角（BEV）特征，预测车道分隔线、人行横道和道路边界等地图元素。本文使用 ResNet-50 和 nuScenes 24 epoch 训练配置。
 
 ## 2. 优化接入基线
 
-TurboPhysAI 的 MapTRv2 优化基于官方 `hustvl/MapTR` 仓库的 `maptrv2` 分支，锁定 commit：
+TurboPhysAI 的 MapTRv2 优化基于官方 `maptrv2` 分支 commit `e03f097abef19e1ba3fed5f471a8d80fbfa0a064` 接入。优化接入基线的使用建议见[模型支持清单](../../docs/zh/models/support_list.md)。
 
-```text
-e03f097abef19e1ba3fed5f471a8d80fbfa0a064
-```
+## 3. 构建训练环境
 
-## 3. 准备模型源码
-
-首次准备模型仓库时执行：
+在 HCU 宿主机上设置镜像、容器名称和资源目录。下面以宿主机的 `/workspace` 和 `/dataset` 为例，分别挂载到容器的相同路径，以便沿用当前环境的模型、权重和 nuScenes 数据路径；如宿主机路径不同，请调整变量。
 
 ```bash
-cd /workspace
-mkdir -p model
-git clone -b maptrv2 https://github.com/hustvl/MapTR.git model/MapTrv2
+export IMAGE=harbor.sourcefind.cn:5443/hcu/admin/base/autonomous-driving:ubuntu22.04-dtk26.04-torch2.10-py3.10-20261107
+export CONTAINER_NAME=maptrv2
+export HOST_WORKSPACE=/workspace
+export HOST_DATASET=/dataset
+
+docker pull "$IMAGE"
+docker run -dit \
+  --name "$CONTAINER_NAME" \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --shm-size=128G \
+  --workdir=/workspace \
+  -v /opt/hyhal:/opt/hyhal:ro \
+  -v "$HOST_WORKSPACE":/workspace \
+  -v "$HOST_DATASET":/dataset \
+  "$IMAGE" /bin/bash
+
+docker exec -it "$CONTAINER_NAME" bash
+```
+
+进入容器后安装 TurboPhysAI，后续命令均在容器内执行：
+
+```bash
+/usr/bin/python3 -m pip install --upgrade turbo-physai \
+  -i https://pypi.sourcefind.cn/nightly/dtk2604/ --no-deps
+```
+
+模型源码、数据和权重需单独准备。以上宿主机目录须实际包含后文所需资源，尤其要保证 `data/nuscenes` 软链接指向的 `/dataset/nuscenes` 在容器中可访问。已有容器需要重新创建才能增加挂载。镜像和安装说明见[安装指南](../../docs/zh/get_started/installation.md#使用配套镜像)。
+
+在容器中可通过 `hy-smi` 检查设备，通过 `turbo-physai --help` 检查组件安装。
+
+## 4. 准备模型源码
+
+```bash
+mkdir -p /workspace/model
+cd /workspace/model
+git clone -b maptrv2 https://github.com/hustvl/MapTR.git MapTrv2
 cd /workspace/model/MapTrv2
 git checkout --detach e03f097abef19e1ba3fed5f471a8d80fbfa0a064
 mkdir -p data ckpts work_dirs
-
-git rev-parse HEAD
-git status --short
 ```
 
-生成 OptimizationConfig 时模型工作区必须干净。不要在该基线仓库内克隆 TurboPhysAI，也不要为接入优化直接修改模型源码。数据、权重和训练输出使用基线已经忽略的 `data/`、`ckpts/`、`work_dirs/` 目录。
+也可使用已准备的官方源码，执行 `git rev-parse HEAD` 检查版本。当前容器中的训练配置有本地修改；生成 OptimizationConfig 时需要干净的模型工作区。
 
-也可以使用已准备好的官方模型仓库。下文命令以 `/workspace/model/MapTrv2` 为模型根目录，实际部署时可调整路径。模型源码、数据集和权重需要单独准备，模型依赖范围见[官方安装说明](https://github.com/hustvl/MapTR/blob/maptrv2/docs/install.md)，具体版本应与 HCU 环境匹配。
+## 5. 准备 nuScenes 数据
 
-## 4. 准备 nuScenes 数据
-
-从 [nuScenes 下载页](https://www.nuscenes.org/download) 获取 nuScenes v1.0 full 数据、地图扩展及 CAN bus expansion，并按[官方数据准备说明](https://github.com/hustvl/MapTR/blob/maptrv2/docs/prepare_dataset.md) 准备 MapTRv2 专用地图 info 文件。TurboPhysAI 不负责下载或转换数据集。
-
-将解压后的数据放入模型的 `data/` 目录，也可以链接已经准备好的数据目录。预期目录结构为：
+从 [nuScenes 下载页](https://www.nuscenes.org/download)获取数据和许可，按 [MapTR 官方数据准备说明](https://github.com/hustvl/MapTR/blob/maptrv2/docs/prepare_dataset.md)准备数据、地图扩展和 MapTRv2 专用的 train/val info 文件。自行生成 info 文件时还需 CAN bus expansion。当前容器已准备数据和验证地图标注。已有资源可跳过下载和转换；以下路径为容器内路径：
 
 ```text
-/workspace/model/MapTrv2/data/
-├── can_bus/
-└── nuscenes/
-    ├── maps/
-    │   └── expansion/
-    ├── samples/
-    ├── sweeps/
-    ├── v1.0-trainval/
-    ├── v1.0-test/
-    ├── nuscenes_map_infos_temporal_train.pkl
-    └── nuscenes_map_infos_temporal_val.pkl
+/workspace/model/MapTrv2/data/nuscenes -> /dataset/nuscenes
+├── maps/、samples/、sweeps/、v1.0-trainval/
+├── nuscenes_map_infos_temporal_train.pkl
+└── nuscenes_map_infos_temporal_val.pkl
+/workspace/MapTRv2/anno_pkls/nuscenes_map_anns_val.json
 ```
 
-已有 MapTRv2 专用 info 文件时可以直接使用。尚未生成时，在模型依赖已安装的环境中执行：
+验证地图标注不在模型配置默认的数据目录中，下面的训练命令显式指定该路径。其他环境请按实际挂载位置调整。
 
-```bash
-cd /workspace/model/MapTrv2
-python tools/maptrv2/custom_nusc_map_converter.py \
-  --root-path ./data/nuscenes \
-  --out-dir ./data/nuscenes \
-  --extra-tag nuscenes \
-  --version v1.0 \
-  --canbus ./data
+## 6. 准备预训练权重
 
-ls -lh data/nuscenes/nuscenes_map_infos_temporal_{train,val}.pkl
-```
-
-基线转换脚本会依次处理 trainval 和 test，因此上述流程需要准备 `v1.0-test`，并允许写入输出目录。`--canbus ./data` 指向包含 `can_bus/` 的父目录。
-
-训练配置读取的是 `nuscenes_map_infos_temporal_train.pkl` 和 `nuscenes_map_infos_temporal_val.pkl`，不能用普通的 `nuscenes_infos_temporal_*.pkl` 替代。验证配置还使用 `nuscenes_map_anns_val.json`；该基线的数据集评估代码可在首次评估时生成此文件，因此评估时相应目录也需要可写。
-
-## 5. 准备预训练权重
-
-R50 配置从 `ckpts/resnet50-19c8e357.pth` 加载图像 Backbone 预训练权重：
+R50 配置使用 `ckpts/resnet50-19c8e357.pth`。当前容器已准备该文件；缺少时可从 PyTorch 下载：
 
 ```bash
 cd /workspace/model/MapTrv2
 mkdir -p ckpts
-wget -O ckpts/resnet50-19c8e357.pth \
+test -e ckpts/resnet50-19c8e357.pth || wget -O ckpts/resnet50-19c8e357.pth \
   https://download.pytorch.org/models/resnet50-19c8e357.pth
-
-ls -lh ckpts/resnet50-19c8e357.pth
 ```
 
-## 6. 准备优化配置
+## 7. 通过 turbo-physai run 启动训练
 
-TurboPhysAI 已安装在镜像的 Python 环境中。源码安装和环境检查方法见[安装指南](../../docs/zh/get_started/installation.md)。后续命令使用当前 Python 环境，并从实际安装位置获取 MapTRv2 配置目录，无需固定组件安装路径：
+`--model maptrv2` 加载已安装 TurboPhysAI 中的 OptimizationConfig 和 RuntimeConfig，请确认安装的组件包含 MapTRv2 优化。修改 recipe 或更换环境后，可按 [MapTRv2 优化说明](../../turbo_physai/optimizations/models/maptrv2/README.md)在干净的模型基线上重新生成配置，并通过 `--optimization-config` 指定。
 
-```bash
-export MAPTRV2_CONFIG_DIR="$(python -c 'from pathlib import Path; import turbo_physai.optimizations.models.maptrv2 as model; print(Path(model.__file__).resolve().parent / "configs")')"
-```
+### 7.1 快速验证（单机八卡）
 
-当前 recipe 开启 `maptrv2.fused_adamw`，需要带编译扩展 `amp_C` 的 Apex。实际构建 AdamW 优化器时会检查 Apex 和设备可用性。优化实现及专项测试说明见[MapTRv2 优化说明](../../turbo_physai/optimizations/models/maptrv2/README.md)。
-
-## 7. 生成并核对 OptimizationConfig
-
-在目标训练环境中，针对干净模型基线重新生成源码和 AST 证据：
+使用官方训练入口运行 1 个 epoch，并跳过验证集评估。按当前数据和每卡 batch size 12 的配置，约为 294 次迭代；实际次数取决于数据量和设备数。该命令用于检查训练链路，不用于判断完整精度或稳定吞吐。
 
 ```bash
+set -o pipefail
 cd /workspace/model/MapTrv2
-mkdir -p work_dirs/turbophysai
-
-python -m turbo_physai.cli optimization generate \
-  --recipe "$MAPTRV2_CONFIG_DIR/recipe.yaml" \
-  --repo /workspace/model/MapTrv2 \
-  --commit e03f097abef19e1ba3fed5f471a8d80fbfa0a064 \
-  --output work_dirs/turbophysai/optimization.yaml \
-  --force
-
-python -m turbo_physai.cli optimization check \
-  work_dirs/turbophysai/optimization.yaml \
-  --repo /workspace/model/MapTrv2
-```
-
-`--force` 仅允许覆盖已存在的输出文件，不绕过 commit、干净工作区或目标符号检查。生成的 trust 证据与模型和实际导入的 PyTorch/MMCV 等目标实现绑定；更换环境或目标源码后需要重新生成、检查。
-
-当前 recipe 包含 16 个 MapTRv2 Group，并继承公共 `mmcv.msda`，覆盖训练布局、DataLoader、DataContainer pin、Apex FusedAdamW、BEV pooling 布局、掩码和数据向量化、匹配静态化、编译边界及 DDP static graph。实现细节见[MapTRv2 优化说明](../../turbo_physai/optimizations/models/maptrv2/README.md)。OptimizationConfig 和 RuntimeConfig 的字段说明分别见[优化配置指南](../../docs/zh/user_guide/optimization_config.md)和[运行配置指南](../../docs/zh/user_guide/runtime_config.md)。
-
-## 8. 单机八卡训练
-
-在模型根目录启动训练，使配置中的相对数据、权重和输出路径正确解析：
-
-```bash
-cd /workspace/model/MapTrv2
+export SMOKE_OUTPUT="work_dirs/maptrv2_smoke_$(date +%Y%m%d_%H%M%S)_$$"
+mkdir -p "$SMOKE_OUTPUT"
 
 turbo-physai run \
-  --optimization-config work_dirs/turbophysai/optimization.yaml \
-  --runtime-config "$MAPTRV2_CONFIG_DIR/runtime.yaml" \
+  --model maptrv2 \
   --log-report \
   torchrun --nproc-per-node=8 --master-port=29501 tools/train.py \
     projects/configs/maptrv2/maptrv2_nusc_r50_24ep.py \
     --launcher pytorch \
-    --work-dir work_dirs/maptrv2_optimized_8card
+    --no-validate \
+    --work-dir "$SMOKE_OUTPUT" \
+    --cfg-options \
+      data.samples_per_gpu=12 \
+      total_epochs=1 \
+      runner.max_epochs=1 \
+      log_config.interval=1 2>&1 | tee "$SMOKE_OUTPUT/train.log"
 ```
 
-`--nproc-per-node=8` 创建八个本地训练进程，应与可用设备数一致；`29501` 应为可用端口。基线配置为每卡 4 个样本、4 个 DataLoader worker，使用 FP16 训练。
+确认命令退出码为 0、日志达到第 1 epoch 的最后一次迭代，并检查优化报告中各组的状态。`applied` 表示优化已安装，实际执行仍取决于运行条件。
 
-RuntimeConfig 提供 MIOpen、rocBLAS、RCCL、Inductor 和 NUMA 设置。其网络与拓扑参数来自参考八卡环境，不应直接当作其他机器的通用最优值。命令行 `--set NAME=VALUE` 可以覆盖环境值，`--disable-numa` 可以关闭自动 NUMA 绑定。
+### 7.2 单机八卡训练
 
-需要指定通信网卡时，在 `torchrun` 前增加 `--set NCCL_SOCKET_IFNAME=<interface>`，将 `<interface>` 替换为实际网卡名。
+以下命令使用每卡 batch size 12、第 24 epoch 验证、每 iteration 输出日志：
 
-需要临时关闭 Apex 优化时，在 `torchrun` 前增加 `--disable-group maptrv2.fused_adamw`；关闭 DataContainer pin 时增加 `--disable-group maptrv2.datacontainer_pin`。后者不会同时关闭 `maptrv2.data` 对 DataLoader `pin_memory` 的设置。永久修改 Group 开关时更新 recipe，并重新生成 OptimizationConfig。
+```bash
+set -o pipefail
+cd /workspace/model/MapTrv2
+export TRAIN_OUTPUT="work_dirs/maptrv2_optimized_$(date +%Y%m%d_%H%M%S)_$$"
+mkdir -p "$TRAIN_OUTPUT"
 
-## 9. 优化状态确认
-
-启用 `--log-report` 后，Rank 0 在优化安装完成时输出报告：
-
-```text
-TURBO_PHYSAI_OPTIMIZATION_REPORT_BEGIN run_id=<run-id>
-...
-Summary: applied=17 skipped=0 blocked=0 failed=0 rolled_back=0 not_started=0
-...
-TURBO_PHYSAI_OPTIMIZATION_REPORT_END run_id=<run-id>
+turbo-physai run \
+  --model maptrv2 \
+  --log-report \
+  torchrun --nproc-per-node=8 --master-port=29501 tools/train.py \
+    projects/configs/maptrv2/maptrv2_nusc_r50_24ep.py \
+    --launcher pytorch \
+    --work-dir "$TRAIN_OUTPUT" \
+    --cfg-options \
+      data.samples_per_gpu=12 \
+      data.val.map_ann_file=/workspace/MapTRv2/anno_pkls/nuscenes_map_anns_val.json \
+      data.test.map_ann_file=/workspace/MapTRv2/anno_pkls/nuscenes_map_anns_val.json \
+      evaluation.interval=24 \
+      log_config.interval=1 2>&1 | tee "$TRAIN_OUTPUT/train.log"
 ```
 
-上述计数对应当前全部启用的 17 个 Group；临时禁用或修改 recipe 后计数会变化。报告发生在训练迭代之前，`applied` 表示替换或包装已安装，不表示所有优化路径已经执行，也不证明模型精度和性能。
+`--model maptrv2` 自动加载内置配置。确保端口未被占用，并根据实际 HCU 拓扑调整 RuntimeConfig 的 RCCL、NUMA 参数；需要指定网卡时，可在 `torchrun` 前添加 `--set NCCL_SOCKET_IFNAME=<网卡名>`。
 
-确认预期 Group 为 `applied`，并检查 `blocked`、`failed`、`rolled_back`、`not_started` 及每项原因，再结合训练 loss、验证指标和稳定迭代吞吐判断实际效果。报告字段和排查方法见[优化应用报告](../../docs/zh/user_guide/report.md)及[问题排查](../../docs/zh/user_guide/troubleshooting.md)。
+优化应用状态的确认方法见[优化应用报告](../../docs/zh/user_guide/report.md)。

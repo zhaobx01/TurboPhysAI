@@ -26,56 +26,49 @@ extends:
 compatibility: {}
 
 optimization_groups:
-  # Training runtime: channels-last, cuDNN benchmark, fork workers.
+  # Compatibility: HCU layout, environment-dependent registry fixes, and evaluation.
+  # training also contains performance settings (channels-last / cuDNN benchmark).
   - id: maptrv2.training
     enabled: true
-  # DataLoader pin_memory=True.
-  - id: maptrv2.data
-    enabled: true
-  # v4/v3 additions remain opt-in pending target-HCU performance/accuracy runs.
-  - id: maptrv2.datacontainer_pin
-    enabled: true
-  - id: maptrv2.fused_adamw
-    enabled: true
-  # ROCm bev_pool layout fix: permute [B,Z,H,W,C] -> [B,C,Z,H,W].
   - id: maptrv2.bev_pool_fix
     enabled: true
-  # Dynamo-safe GridMask.
-  - id: maptrv2.grid_mask
-    enabled: true
-  # cdist(p=1) -> broadcast subtraction.
-  - id: maptrv2.match_cost
-    enabled: true
-  # Vectorized PV-mask resampling plus the merged BEV-mask affine transform.
-  - id: maptrv2.pv_mask
-    enabled: true
-  # Arc-length resampling for shift_fixed_num_sampled_points_v2 (the pattern
-  # selected by gt_shift_pts_pattern='v2').
-  - id: maptrv2.dataset_vectorization
-    enabled: true
-  # EfficientNet may override an already registered backbone entry.
   - id: maptrv2.efficientnet
     enabled: true
-  # The vendored mmdet3d SparseConv classes may be pre-registered by an image.
   - id: maptrv2.spconv_registry
     enabled: true
-  # torch.compile on the extracted pure-tensor hot methods. Enable after the
-  # accuracy/throughput A/B on the target machine.
-  - id: maptrv2.compile
-    enabled: true
-  # Complete static assignment contract plus Dynamo-isolated Hungarian solver.
-  - id: maptrv2.assigner
-    enabled: true
-  # v5 A1: remove redundant Boolean-mask cleanup; A2: keep normalization on device.
-  - id: maptrv2.sync_elimination
-    enabled: true
-  # Eight reference helper boundaries and the reference 5D BEV layout.
-  - id: maptrv2.reference_boundaries
-    enabled: true
-  # Validation: Shapely 2 STRtree.query returns indices, not geometries.
   - id: maptrv2.eval_compat
     enabled: true
-  # Inherited from framework.mmcv.hcu; overridden here so the whole recipe can
-  # be switched off in one place.
+
+  # Data pipeline: pinned memory and vectorized annotation processing.
+  - id: maptrv2.data
+    enabled: true
+  - id: maptrv2.datacontainer_pin
+    enabled: true
+  - id: maptrv2.pv_mask
+    enabled: true
+  - id: maptrv2.dataset_vectorization
+    enabled: true
+
+  # Optimizer and operator acceleration.
+  - id: maptrv2.fused_adamw
+    enabled: true
+  # Inherited from framework.mmcv.hcu; keep its switch explicit here.
   - id: mmcv.msda
+    enabled: true
+  # Broadcast L1 matching cost instead of cdist(p=1).
+  - id: maptrv2.match_cost
+    enabled: true
+
+  # Training computation: remove redundant work and device synchronization.
+  - id: maptrv2.sync_elimination
+    enabled: true
+
+  # Compilation: Dynamo-safe augmentation, static matching, and tensor boundaries.
+  - id: maptrv2.grid_mask
+    enabled: true
+  - id: maptrv2.assigner
+    enabled: true
+  - id: maptrv2.reference_boundaries
+    enabled: true
+  - id: maptrv2.compile
     enabled: true

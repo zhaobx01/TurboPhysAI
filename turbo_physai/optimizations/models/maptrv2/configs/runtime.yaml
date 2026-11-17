@@ -12,8 +12,6 @@ environment:
     # MIOpen / rocBLAS settings used by the MapTRv2 launch recipe.
     PYTORCH_MIOPEN_SUGGEST_NHWC: "1"
     MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32: "1"
-    # MIOpen counterpart of torch.backends.cudnn.benchmark: exhaustively
-    # search for the fastest convolution solver once and cache it.
     MIOPEN_FIND_MODE: "1"
     ROCBLAS_MATH_MODE: "1"
 
@@ -32,27 +30,5 @@ environment:
     TORCHINDUCTOR_MAX_AUTOTUNE_CONV_BACKENDS: ATEN
     TORCHINDUCTOR_CACHE_DIR: /tmp/maptrv2/torchinductor
 
-    # Explicit switches for every maptrv2.* group that is enabled by default.
-    TURBO_PHYSAI_CHANNELS_LAST: "1"
-    TURBO_PHYSAI_CHANNELS_LAST_SCOPE: model
-    # The reference implementation calls set_float32_matmul_precision("high");
-    # set TURBO_PHYSAI_MATMUL_PRECISION=off to restore the stock numerics.
-    TURBO_PHYSAI_MATMUL_PRECISION: high
-    TURBO_PHYSAI_CUDNN_BENCHMARK: "1"
-    TURBO_PHYSAI_FORK_START_METHOD: "1"
-    TURBO_PHYSAI_MAPTRV2_ASSIGN_COMPILE: "1"
-    TURBO_PHYSAI_DATALOADER_START_METHOD: fork
-    TURBO_PHYSAI_PIN_MEMORY: "1"
-    TURBO_PHYSAI_DISABLE_PV_MASK: "0"
-  # ``set`` only forces values; anything the caller's shell already exported
-  # passes through untouched. List MIOpen/rocBLAS tuning variables here to
-  # guarantee a clean baseline regardless of the launching shell.
-  # unset:
-  #   - MIOPEN_FIND_MODE
-  #   - MIOPEN_PRECISION_FP32_FP32_FP32_TF32_FP32
-  #   - ROCBLAS_MATH_MODE
-
-# The reference implementation ships tools/dist_train_numa.sh, so the recipe
-# keeps NUMA-aware placement enabled.
 process:
   numa: true
