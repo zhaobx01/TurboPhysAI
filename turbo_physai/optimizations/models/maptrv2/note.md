@@ -3262,6 +3262,65 @@ num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).reshape(())
 `LSSTransform`，该组对默认配置基本没有收益；评估 A1 需改用
 `projects/configs/maptr/maptr_tiny_r50_24e_bevformer.py`。
 
+### 4.16 通信流与优化组实测对比
+
+在 8 张 BW1000 64G、PyTorch 2.7.1 的环境中，使用相同的 MapTRv2 训练配置：每卡 batch size 12、4 个 DataLoader worker、全局 batch size 96，关闭 profiler，分别运行 100 step。每组启动前均连续三次检测设备空闲，随机种子为 0，`deterministic=False`。
+
+| 组别 | 优化组 | `ALLREDUCE_STREAM_WITH_COMPUTE` | 结果 |
+| --- | --- | ---: | --- |
+| 全优化 stream1 | 17 个优化组 | `1` | 完成 100 step |
+| 全优化 stream0 | 17 个优化组 | `0` | 完成 100 step |
+| 仅兼容项 stream1 | `training`、`bev_pool_fix`、`efficientnet`、`spconv_registry`、`eval_compat` | `1` | 完成 100 step |
+
+数据目录：`/workspace/training_runs/maptrv2_100step_three_cases_20261118/`；各组分别保存在 `all_stream1/`、`all_stream0/` 和 `compatibility_stream1/`，包含启动命令、训练日志和逐 step JSON 日志。仅兼容项组同时关闭了 `mmcv.msda`、数据流水线、匹配代价、编译等其他组；`training` 组本身仍包含 channels-last 等性能设置。
+
+**关闭 profiler 的吞吐对比**：去掉前 20 step，按日志中第 21–100 step 的 `time` 均值计算；全局吞吐 = 96 ÷ 平均 step 耗时，单卡吞吐 = 12 ÷ 平均 step 耗时。`data_time` 为日志记录的数据准备时间，不应与 step 耗时相加。
+
+| 指标：第 21–100 step | 全优化 stream1 | 全优化 stream0 | 仅兼容项 stream1 |
+| --- | ---: | ---: | ---: |
+| 平均 step 耗时（s） | 1.315 | 1.329 | 2.986 |
+| step 耗时中位数（s） | 1.308 | 1.324 | 2.998 |
+| 全局吞吐（samples/s） | 73.01 | 72.24 | 32.15 |
+| 单卡吞吐（samples/s） | 9.13 | 9.03 | 4.02 |
+| 平均 `data_time`（s） | 0.012 | 0.021 | 0.284 |
+| 日志记录显存（MB） | 42061 | 42061 | 50374 |
+
+相同优化组下，`1` 的吞吐比 `0` 高约 **1.1%**；差异较小，每组仅运行一次，暂不能判断哪个设置稳定更优。相同通信流设置下，全优化组吞吐约为仅兼容项组的 **2.27 倍**；由于同时改变多个优化组，不能将差异归因于某一个优化项。仅兼容项组的 `data_time` 更高，值得进一步排查数据流水线，但现有日志不能确定具体原因。
+
+| 采样范围与指标 | 全优化 stream1 | 全优化 stream0 | 仅兼容项 stream1 |
+| --- | ---: | ---: | ---: |
+| 第 38 step 耗时（s） | 1.268 | 1.290 | 3.139 |
+| 第 38 step 全局吞吐（samples/s） | 75.71 | 74.44 | 30.58 |
+| 第 41–50 step 平均耗时（s） | 1.314 | 1.304 | 3.015 |
+| 第 41–50 step 全局吞吐（samples/s） | 73.07 | 73.64 | 31.84 |
+| 第 41–50 step 单卡吞吐（samples/s） | 9.13 | 9.21 | 3.98 |
+
+**Loss 对比**：
+
+| Step | 全优化 stream1 | 全优化 stream0 | 仅兼容项 stream1 |
+| ---: | ---: | ---: | ---: |
+| 1 | 534.452 | 534.452 | 534.403 |
+| 20 | 282.949 | 283.308 | 280.252 |
+| 38 | 210.839 | 210.896 | 210.027 |
+| 50 | 193.785 | 193.393 | 192.500 |
+| 75 | 173.102 | 172.884 | 173.697 |
+| 100 | 165.025 | 165.364 | 165.376 |
+
+三组短程 loss 下降趋势接近，100 step 不能证明完整训练收敛结果或最终 mAP 一致。
+
+**Profiler trace 旁证**：另一次同配置的全优化采集使用 skip 200、wait 1、warmup 5、active 3；下表采用各运行 rank 0 的 CPU 侧 `ProfilerStep#207` 窗口。通信时间为窗口内通信 kernel 的时间区间并集，重叠为该并集与计算 kernel 区间的交集；暴露通信是未与计算 kernel 重叠的部分。
+
+| 指标（ms） | 全优化 stream1 | 全优化 stream0 |
+| --- | ---: | ---: |
+| Profiler step 时间 | 1464.68 | 1482.14 |
+| 通信区间并集 | 149.86 | 104.30 |
+| 通信与计算重叠 | 0.00 | 0.35 |
+| 暴露通信 | 149.86 | 103.95 |
+
+Trace 目录为 `/workspace/training_runs/maptrv2_stream_ab_trace_20261118_retry/`，各组 `bottleneck_report/report.md` 保存了统计口径和八卡数据。`0` 的采样窗口中通信和计算重叠仍很少；单个带 profiler 的 step 不能证明稳态收益，通信统计也包含非梯度同步的集合操作。
+
+**结论**：当前数据支持全优化配置在本次短程测试中明显快于仅兼容项配置；对于通信流 `0` 和 `1`，目前两者吞吐接近，还需在相同条件下关闭 profiler 多次重复测速，并通过完整训练验证精度。显式设置 `0` 不等同于取消设置：未设置时的实际行为取决于继承环境和运行时默认值。
+
 ## 5. 优化点定位方法
 
 上面的每一项都是"看到症状 → 想到手法"的过程，通用流程：

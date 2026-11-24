@@ -115,29 +115,31 @@ turbo-physai run \
 
 ### 7.2 单机八卡训练
 
-以下命令使用每卡 batch size 12、第 24 epoch 验证、每 iteration 输出日志：
+以下命令使用 8 卡、每卡 batch size 12，并沿用当前模型配置的每卡 4 个 DataLoader worker 和 24 epoch；命令显式指定第 24 epoch 验证、逐 step 输出日志：
 
 ```bash
 set -o pipefail
 cd /workspace/model/MapTrv2
+export PYTHONPATH="/workspace/TurboPhysAI${PYTHONPATH:+:$PYTHONPATH}"
 export TRAIN_OUTPUT="work_dirs/maptrv2_optimized_$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$TRAIN_OUTPUT"
 
 turbo-physai run \
-  --model maptrv2 \
+  --optimization-config /workspace/TurboPhysAI/turbo_physai/optimizations/models/maptrv2/configs/optimization.yaml \
+  --runtime-config /workspace/TurboPhysAI/turbo_physai/optimizations/models/maptrv2/configs/runtime.yaml \
   --log-report \
-  torchrun --nproc-per-node=8 --master-port=29501 tools/train.py \
+  torchrun --nproc-per-node=8 --master-port=29513 tools/train.py \
     projects/configs/maptrv2/maptrv2_nusc_r50_24ep.py \
     --launcher pytorch \
     --work-dir "$TRAIN_OUTPUT" \
     --cfg-options \
       data.samples_per_gpu=12 \
       data.val.map_ann_file=/workspace/MapTRv2/anno_pkls/nuscenes_map_anns_val.json \
-      data.test.map_ann_file=/workspace/MapTRv2/anno_pkls/nuscenes_map_anns_val.json \
       evaluation.interval=24 \
-      log_config.interval=1 2>&1 | tee "$TRAIN_OUTPUT/train.log"
+      log_config.interval=1 \
+    2>&1 | tee "$TRAIN_OUTPUT/train.log"
 ```
 
-`--model maptrv2` 自动加载内置配置。确保端口未被占用，并根据实际 HCU 拓扑调整 RuntimeConfig 的 RCCL、NUMA 参数；需要指定网卡时，可在 `torchrun` 前添加 `--set NCCL_SOCKET_IFNAME=<网卡名>`。
+该命令使用当前源码目录中的配置，`runtime.yaml` 当前将 `ALLREDUCE_STREAM_WITH_COMPUTE` 设为 `0`；基线日志未记录该变量的实际值。确保端口未被占用，并根据实际 HCU 拓扑调整 RuntimeConfig 的 RCCL、NUMA 参数；需要指定网卡时，可在 `torchrun` 前添加 `--set NCCL_SOCKET_IFNAME=<网卡名>`。
 
 优化应用状态的确认方法见[优化应用报告](../../docs/zh/user_guide/report.md)。
