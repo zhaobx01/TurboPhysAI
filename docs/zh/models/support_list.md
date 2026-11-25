@@ -27,5 +27,6 @@ TurboPhysAI 不强制模型仓库停留在优化接入基线（[可以在优化�
 | GR00T | GR00T N1.7 3B | Cosmos Reason2 / Qwen3-VL | `51d4c89f72fda44cbf77285c6a8114b52676b8a1` | [GR00T](../../../model_examples/Groot/README.md) |
 |  DreamZero  |   DreamZero-5B   | Wan2.2 5B TI2V | `ab790c198fbce33503358efbbd4187ce9a89adf3` | [DreamZero](../../../model_examples/DreamZero/README.md) |
 |  Sparse4D  |  Sparse4D   | Res50 | `249ffbb695f4e9db628d953e2bf6d36de04bbb69` | [Sparse4D](../../../model_examples/Sparse4D/README.md) |
+| LeRobot ACT | ACT | ResNet18 | `3f2179f3b69708b6ad009b2e7685dd9d05269ee1` | [LeRobot ACT](../../../model_examples/LeRobot-ACT/README.md) |
 
 **自动驾驶**、**具身智能**和**世界模型**等方向的模型适配工作持续推进中，请关注后续更新。

@@ -103,6 +103,10 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/open-mmlab/mmdetection3d>
 - Fixed commit: `fe25f7a51d36e3702f961e198894580d83c4387b`
+### LeRobot ACT
+
+- Repository: <https://github.com/huggingface/lerobot>
+- Fixed commit: `3f2179f3b69708b6ad009b2e7685dd9d05269ee1`
 - License: Apache-2.0
 
 | Local file | Upstream file | HYGON modification |
@@ -116,6 +120,12 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/open-mmlab/mmdetection>
 - Fixed commit: `fe3f809a0a514189baf889aa358c498d51ee36cd` (v3.2.0)
+| `turbo_physai/optimizations/models/lerobot_act/deferred_metrics.py` | `src/lerobot/policies/act/modeling_act.py` | Modified |
+
+### LeRobot ACT / Hugging Face Accelerate
+
+- Repository: <https://github.com/huggingface/accelerate>
+- Fixed commit: `6afc1e5ee217051fde702b23de2813344dc0fd33` (v1.15.0)
 - License: Apache-2.0
 
 | Local file | Upstream file | HYGON modification |
@@ -130,6 +140,7 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 The DVR files retain FlashOCC's attribution to [4d-occ-forecasting](https://github.com/tarashakhurana/4d-occ-forecasting), whose repository includes an [MIT license](https://github.com/tarashakhurana/4d-occ-forecasting/blob/e1ea9434113d303986684395a961aaacac90d470/LICENSE).
 | `turbo_physai/optimizations/models/pointpillars/tensorized_assigner.py` | `mmdet/models/task_modules/assigners/max_iou_assigner.py` | Modified |
+| `turbo_physai/optimizations/models/lerobot_act/h2d_prefetch_stream.py` | `src/accelerate/data_loader.py` | Modified |
 
 ### MMCV
 
