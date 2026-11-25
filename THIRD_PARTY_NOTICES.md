@@ -91,12 +91,17 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/huggingface/diffusers>
 - Fixed commit: `275869dcae4ebcfee6a80253fdabc56033335020` (v0.38.0)
+### OpenPI
+
+- Repository: <https://github.com/Physical-Intelligence/openpi>
+- Fixed commit: `215abfb217dbac7d5f1273282331b9b1866c0479`
 - License: Apache-2.0
 
 | Local file | Upstream file | HYGON modification |
 | --- | --- | --- |
 | `turbo_physai/optimizations/models/dit4dit/cosmos_attention.py` | `src/diffusers/models/transformers/transformer_cosmos.py` | Modified |
 | `turbo_physai/optimizations/models/dit4dit/cosmos_forward.py` | `src/diffusers/models/transformers/transformer_cosmos.py` (`CosmosTransformer3DModel.forward`) | Modified |
+| `turbo_physai/optimizations/models/openpi/gemma_checkpoint_stride.py` | `src/openpi/models_pytorch/gemma_pytorch.py` | Modified |
 
 ### MMCV
 
