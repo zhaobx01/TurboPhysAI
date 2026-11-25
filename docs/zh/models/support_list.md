@@ -6,6 +6,8 @@
 
 TurboPhysAI 不强制模型仓库停留在优化接入基线（[可以在优化接入基线之外的模型版本上使用吗？](../faq.md#可以在优化接入基线之外的模型版本上使用吗)）。
 
+Cosmos3 通过独立源码补丁提供适配，需使用指定基线应用补丁，再通过 Cosmos 原生训练入口运行。Generator Nano 已完成训练流程验证，Action Policy 和 Reasoner 待验证，具体步骤见模型使用说明。
+
 ## 已支持模型
 
 |   模型   |     Method     | Backbone |                 优化接入基线                 |                       使用说明                       |
@@ -29,5 +31,6 @@ TurboPhysAI 不强制模型仓库停留在优化接入基线（[可以在优化�
 |  DreamZero  |   DreamZero-5B   | Wan2.2 5B TI2V | `ab790c198fbce33503358efbbd4187ce9a89adf3` | [DreamZero](../../../model_examples/DreamZero/README.md) |
 |  Sparse4D  |  Sparse4D   | Res50 | `249ffbb695f4e9db628d953e2bf6d36de04bbb69` | [Sparse4D](../../../model_examples/Sparse4D/README.md) |
 | LeRobot ACT | ACT | ResNet18 | `3f2179f3b69708b6ad009b2e7685dd9d05269ee1` | [LeRobot ACT](../../../model_examples/LeRobot-ACT/README.md) |
+| Cosmos3 | Generator Nano（已验证） / Action Policy（待验证） / Reasoner（待验证） | — | `9726697a83315540c6885baefd2fe353d9c74920` | [Cosmos3](../../../model_examples/Cosmos3/README.md) |
 
 **自动驾驶**、**具身智能**和**世界模型**等方向的模型适配工作持续推进中，请关注后续更新。
