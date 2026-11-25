@@ -117,22 +117,42 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/huggingface/diffusers>
 - Fixed commit: `275869dcae4ebcfee6a80253fdabc56033335020` (v0.38.0)
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
+| `turbo_physai/optimizations/models/dit4dit/cosmos_attention.py` | `src/diffusers/models/transformers/transformer_cosmos.py` | Modified |
+| `turbo_physai/optimizations/models/dit4dit/cosmos_forward.py` | `src/diffusers/models/transformers/transformer_cosmos.py` (`CosmosTransformer3DModel.forward`) | Modified |
+
 ### OpenPI
 
 - Repository: <https://github.com/Physical-Intelligence/openpi>
 - Fixed commit: `215abfb217dbac7d5f1273282331b9b1866c0479`
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
+| `turbo_physai/optimizations/models/openpi/gemma_checkpoint_stride.py` | `src/openpi/models_pytorch/gemma_pytorch.py` | Modified |
+
 ### FlashOCC
 
 - Repository: <https://github.com/Yzichen/FlashOCC>
 - Fixed commit: `449dc7947d6549ccb72a99d6f6d8c02f166ec0dd`
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
+| `turbo_physai/optimizations/models/flashocc/geometry_compile.py` | `projects/mmdet3d_plugin/models/necks/view_transformer.py` (`LSSViewTransformer.get_ego_coor`) | Modified |
+| `turbo_physai/optimizations/models/flashocc/voxel_pooling_compile.py` | `projects/mmdet3d_plugin/models/necks/view_transformer.py` (`LSSViewTransformer.voxel_pooling_prepare_v2`) | Modified |
+| `turbo_physai/optimizations/models/flashocc/compat_sources/dvr/dvr.cpp` | `lib/dvr/dvr.cpp` | Unmodified |
+| `turbo_physai/optimizations/models/flashocc/compat_sources/dvr/dvr.cu` | `lib/dvr/dvr.cu` | Modified |
+
+The DVR files retain FlashOCC's attribution to [4d-occ-forecasting](https://github.com/tarashakhurana/4d-occ-forecasting), whose repository includes an [MIT license](https://github.com/tarashakhurana/4d-occ-forecasting/blob/e1ea9434113d303986684395a961aaacac90d470/LICENSE).
+
 ### PointPillars / OpenMMLab MMDetection3D
 
 - Repository: <https://github.com/open-mmlab/mmdetection3d>
 - Fixed commit: `fe25f7a51d36e3702f961e198894580d83c4387b`
-### LeRobot ACT
-
-- Repository: <https://github.com/huggingface/lerobot>
-- Fixed commit: `3f2179f3b69708b6ad009b2e7685dd9d05269ee1`
 - License: Apache-2.0
 
 | Local file | Upstream file | HYGON modification |
@@ -146,6 +166,20 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/open-mmlab/mmdetection>
 - Fixed commit: `fe3f809a0a514189baf889aa358c498d51ee36cd` (v3.2.0)
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
+| `turbo_physai/optimizations/models/pointpillars/tensorized_assigner.py` | `mmdet/models/task_modules/assigners/max_iou_assigner.py` | Modified |
+
+### LeRobot ACT
+
+- Repository: <https://github.com/huggingface/lerobot>
+- Fixed commit: `3f2179f3b69708b6ad009b2e7685dd9d05269ee1`
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
 | `turbo_physai/optimizations/models/lerobot_act/deferred_metrics.py` | `src/lerobot/policies/act/modeling_act.py` | Modified |
 
 ### LeRobot ACT / Hugging Face Accelerate
@@ -156,16 +190,6 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 | Local file | Upstream file | HYGON modification |
 | --- | --- | --- |
-| `turbo_physai/optimizations/models/dit4dit/cosmos_attention.py` | `src/diffusers/models/transformers/transformer_cosmos.py` | Modified |
-| `turbo_physai/optimizations/models/dit4dit/cosmos_forward.py` | `src/diffusers/models/transformers/transformer_cosmos.py` (`CosmosTransformer3DModel.forward`) | Modified |
-| `turbo_physai/optimizations/models/openpi/gemma_checkpoint_stride.py` | `src/openpi/models_pytorch/gemma_pytorch.py` | Modified |
-| `turbo_physai/optimizations/models/flashocc/geometry_compile.py` | `projects/mmdet3d_plugin/models/necks/view_transformer.py` (`LSSViewTransformer.get_ego_coor`) | Modified |
-| `turbo_physai/optimizations/models/flashocc/voxel_pooling_compile.py` | `projects/mmdet3d_plugin/models/necks/view_transformer.py` (`LSSViewTransformer.voxel_pooling_prepare_v2`) | Modified |
-| `turbo_physai/optimizations/models/flashocc/compat_sources/dvr/dvr.cpp` | `lib/dvr/dvr.cpp` | Unmodified |
-| `turbo_physai/optimizations/models/flashocc/compat_sources/dvr/dvr.cu` | `lib/dvr/dvr.cu` | Modified |
-
-The DVR files retain FlashOCC's attribution to [4d-occ-forecasting](https://github.com/tarashakhurana/4d-occ-forecasting), whose repository includes an [MIT license](https://github.com/tarashakhurana/4d-occ-forecasting/blob/e1ea9434113d303986684395a961aaacac90d470/LICENSE).
-| `turbo_physai/optimizations/models/pointpillars/tensorized_assigner.py` | `mmdet/models/task_modules/assigners/max_iou_assigner.py` | Modified |
 | `turbo_physai/optimizations/models/lerobot_act/h2d_prefetch_stream.py` | `src/accelerate/data_loader.py` | Modified |
 
 ### MMCV
