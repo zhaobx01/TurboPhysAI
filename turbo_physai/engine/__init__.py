@@ -42,6 +42,7 @@ from .definitions.registry import Registry, default_registry as _default_registr
 from .execution.report import build_report, emit_report
 from .execution.replacements import default_handlers
 from .config.loader import OptimizationConfigCatalog, load_optimization_config, resolve_optimization_config_path
+from .config.overrides import apply_option_overrides
 
 
 PathLike = Union[str, os.PathLike]
@@ -191,6 +192,7 @@ def _resolve(
     force_groups: Sequence[str],
     disable_groups: Sequence[str],
     accuracy_mode: bool = False,
+    option_overrides=None,
 ) -> Tuple[
     OptimizationConfig,
     PreparedExecution,
@@ -204,6 +206,7 @@ def _resolve(
         model=model,
     )
     config = load_optimization_config(resolved_config_path, catalog=catalog)
+    config = apply_option_overrides(config, option_overrides)
     dependencies = config.compatibility.get("dependencies", {})
     dependency_names = dependencies.keys() if hasattr(dependencies, "keys") else ()
     context = detect_context(dependency_names=dependency_names)
@@ -377,6 +380,7 @@ def apply(
     force_groups: Sequence[str] = (),
     disable_groups: Sequence[str] = (),
     accuracy_mode: bool = False,
+    option_overrides=None,
 ) -> OptimizationReport:
     """Apply one OptimizationConfig during process startup and report its result.
 
@@ -391,6 +395,7 @@ def apply(
     ``force_groups`` bypasses only overrideable checks for the named enabled Groups.
     ``accuracy_mode`` applies ``accuracy_only`` Groups; when False those Groups and
     their dependents are skipped for this call.
+    ``option_overrides`` maps ``GROUP_ID.KEY`` to per-run option values.
     """
 
     _claim_apply()
@@ -410,6 +415,7 @@ def apply(
         force_groups=force_groups,
         disable_groups=disable_groups,
         accuracy_mode=accuracy_mode,
+        option_overrides=option_overrides,
     )
     regular_outcome: ExecutionOutcome = Executor().execute(
         regular_prepared, prepared_groups=prepared_groups
