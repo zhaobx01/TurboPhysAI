@@ -99,6 +99,23 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 
 - Repository: <https://github.com/Yzichen/FlashOCC>
 - Fixed commit: `449dc7947d6549ccb72a99d6f6d8c02f166ec0dd`
+### PointPillars / OpenMMLab MMDetection3D
+
+- Repository: <https://github.com/open-mmlab/mmdetection3d>
+- Fixed commit: `fe25f7a51d36e3702f961e198894580d83c4387b`
+- License: Apache-2.0
+
+| Local file | Upstream file | HYGON modification |
+| --- | --- | --- |
+| `turbo_physai/optimizations/models/pointpillars/unique_free_sampler.py` | `mmdet3d/models/task_modules/samplers/pseudosample.py` | Modified |
+| `turbo_physai/optimizations/models/pointpillars/pillar_scatter.py` | `mmdet3d/models/middle_encoders/pillar_scatter.py` | Modified |
+| `turbo_physai/optimizations/models/pointpillars/native_limit_period.py` | `mmdet3d/structures/bbox_3d/utils.py` | Modified |
+| `turbo_physai/optimizations/models/pointpillars/compiled_nearest_bev_iou.py` | `mmdet3d/structures/ops/iou3d_calculator.py`; `mmdet3d/structures/bbox_3d/base_box3d.py` | Modified |
+
+### PointPillars / OpenMMLab MMDetection
+
+- Repository: <https://github.com/open-mmlab/mmdetection>
+- Fixed commit: `fe3f809a0a514189baf889aa358c498d51ee36cd` (v3.2.0)
 - License: Apache-2.0
 
 | Local file | Upstream file | HYGON modification |
@@ -112,6 +129,7 @@ The bundled `kernel/sparse_conv/include/prettyprint.h` file is registered separa
 | `turbo_physai/optimizations/models/flashocc/compat_sources/dvr/dvr.cu` | `lib/dvr/dvr.cu` | Modified |
 
 The DVR files retain FlashOCC's attribution to [4d-occ-forecasting](https://github.com/tarashakhurana/4d-occ-forecasting), whose repository includes an [MIT license](https://github.com/tarashakhurana/4d-occ-forecasting/blob/e1ea9434113d303986684395a961aaacac90d470/LICENSE).
+| `turbo_physai/optimizations/models/pointpillars/tensorized_assigner.py` | `mmdet/models/task_modules/assigners/max_iou_assigner.py` | Modified |
 
 ### MMCV
 
@@ -183,7 +201,7 @@ The complete Boost Software License 1.0 text is in [third_party/licenses/Boost-1
 
 Before public release, every newly introduced third-party or mixed-source file must be resolved to an upstream path and 40-character commit and added here.
 
-All previously identified source files now have a direct upstream path and a fixed 40-character source revision. Any newly introduced third-party or mixed source must be added to this file before public release.
+Any newly introduced third-party or mixed source must be added to this file before public release.
 
 ## Hygon modification notice
 
