@@ -457,6 +457,8 @@ setup(
             "optimizations/models/*/configs/.*.generation.json",
             "optimizations/models/flashocc/compat_sources/dvr/*.cpp",
             "optimizations/models/flashocc/compat_sources/dvr/*.cu",
+            "optimizations/models/lingbot_va/flex_assets/manifest.json",
+            "optimizations/models/lingbot_va/flex_assets/templates/*.jinja",
             # _sitedir is deliberately not a package: it must contribute
             # sitecustomize.py to PYTHONPATH without being importable itself.
             "bootstrap/_sitedir/sitecustomize.py",
