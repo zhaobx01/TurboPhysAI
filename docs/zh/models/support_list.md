@@ -23,5 +23,6 @@ TurboPhysAI 不强制模型仓库停留在优化接入基线（[可以在优化�
 | FlashOCC | FlashOCC-R50 | ResNet-50 | `449dc7947d6549ccb72a99d6f6d8c02f166ec0dd` | [FlashOCC](../../../model_examples/FlashOCC/README.md) |
 | PointPillars | PointPillars nuScenes | SECOND | `fe25f7a51d36e3702f961e198894580d83c4387b` | [PointPillars](../../../model_examples/PointPillars/README.md) |
 | LingBot-VA | LingBot-VA LIBERO | Wan2.2 video-action | `7c6ffa9bfc4b83582cafc860fab4c82cc7deeeeb` | [LingBot-VA](../../../model_examples/LingBot-VA/README.md) |
+| LingBot-VLA-V2 | LingBot-VLA-V2-6B | Qwen3-VL-4B | `be969b8fd117fb70550c5d4bf4bc328211b5b1b6` | [LingBot-VLA-V2](../../../model_examples/Lingbot-VLA-V2/README.md) |
 
 **自动驾驶**、**具身智能**和**世界模型**等方向的模型适配工作持续推进中，请关注后续更新。
