@@ -25,5 +25,6 @@ TurboPhysAI 不强制模型仓库停留在优化接入基线（[可以在优化�
 | LingBot-VA | LingBot-VA LIBERO | Wan2.2 video-action | `7c6ffa9bfc4b83582cafc860fab4c82cc7deeeeb` | [LingBot-VA](../../../model_examples/LingBot-VA/README.md) |
 | LingBot-VLA-V2 | LingBot-VLA-V2-6B | Qwen3-VL-4B | `be969b8fd117fb70550c5d4bf4bc328211b5b1b6` | [LingBot-VLA-V2](../../../model_examples/Lingbot-VLA-V2/README.md) |
 | GR00T | GR00T N1.7 3B | Cosmos Reason2 / Qwen3-VL | `51d4c89f72fda44cbf77285c6a8114b52676b8a1` | [GR00T](../../../model_examples/Groot/README.md) |
+|  DreamZero  |   DreamZero-5B   | Wan2.2 5B TI2V | `ab790c198fbce33503358efbbd4187ce9a89adf3` | [DreamZero](../../../model_examples/DreamZero/README.md) |
 
 **自动驾驶**、**具身智能**和**世界模型**等方向的模型适配工作持续推进中，请关注后续更新。
